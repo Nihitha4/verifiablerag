@@ -1,0 +1,14 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local vector database and uploaded documents
+backend/chroma_db/
+backend/uploads/*
+backend/modules/uploads/*
+
+# Local editor and OS files
+.vscode/
+.DS_Store
+Thumbs.db

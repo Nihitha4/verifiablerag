@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>VerifiableRAG — Verified PDF Answers</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<!-- marked.js for markdown rendering in answers -->
+<script src="https://cdn.jsdelivr.net/npm/marked@9.1.6/marked.min.js"></script>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ══════════════════════════════════════════
+       LEFT SIDEBAR  — conversation history
+  ══════════════════════════════════════════ -->
+  <nav class="nav-sidebar" id="navSidebar">
+    <div class="nav-top">
+      <div class="brand">
+        <div class="brand-mark">VR</div>
+        <span class="brand-name">VerifiableRAG</span>
+      </div>
+      <button class="new-chat-btn" id="newChatBtn" title="New conversation">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+        New chat
+      </button>
+    </div>
+
+    <div class="conv-section-label">Conversations</div>
+    <!-- Conversation search -->
+    <div class="conv-search-wrap">
+      <input type="search" id="convSearchInput" class="conv-search" placeholder="Search conversations…" aria-label="Search conversations" />
+    </div>
+    <div class="conv-list" id="convList"></div>
+
+    <div class="nav-bottom">
+      <!-- User button — click to open menu -->
+      <button class="nav-user-btn" id="userMenuBtn" aria-haspopup="true" aria-expanded="false">
+        <div class="user-avatar" id="userAvatar">G</div>
+        <span class="user-name" id="userDisplayName">Guest</span>
+        <svg class="user-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+
+      <!-- Popup menu -->
+      <div class="user-menu" id="userMenu" style="display:none;">
+        <!-- Shown when logged out -->
+        <div id="menuLoggedOut">
+          <div class="user-menu-header">
+            <div class="user-avatar-lg">G</div>
+            <span class="user-menu-name">Continuing as Guest</span>
+            <span class="user-menu-sub">History saved in this browser only</span>
+          </div>
+          <div class="user-menu-divider"></div>
+          <button class="user-menu-item accent" id="menuLoginBtn">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
+            Log in
+          </button>
+          <button class="user-menu-item" id="menuSignupBtn">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+            Sign up
+          </button>
+        </div>
+
+        <!-- Shown when logged in -->
+        <div id="menuLoggedIn" style="display:none;">
+          <div class="user-menu-header">
+            <div class="user-avatar-lg" id="menuAvatarLg">U</div>
+            <span class="user-menu-name" id="menuLoggedInName">User</span>
+            <span class="user-menu-sub" id="menuLoggedInEmail"></span>
+          </div>
+          <div class="user-menu-divider"></div>
+          <button class="user-menu-item danger" id="menuLogoutBtn">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+            Log out
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Login modal (inside sidebar so z-index is easier) -->
+    <div id="authModal" class="auth-modal-overlay" style="display:none;" role="dialog" aria-modal="true">
+      <div class="auth-modal">
+        <button class="auth-close" id="authCloseBtn" aria-label="Close">✕</button>
+
+        <!-- Login form -->
+        <div id="authLoginForm">
+          <div class="auth-brand">
+            <div class="brand-mark" style="width:36px;height:36px;font-size:0.9rem;">VR</div>
+            <span style="font-weight:700;font-size:1rem;color:var(--sidebar-fg);">VerifiableRAG</span>
+          </div>
+          <h2 class="auth-title">Welcome back</h2>
+          <p class="auth-sub">Log in to sync your conversation history.</p>
+          <div class="auth-field">
+            <label class="auth-label">Email</label>
+            <input class="auth-input" id="loginEmail" type="email" placeholder="you@example.com" autocomplete="email" />
+          </div>
+          <div class="auth-field">
+            <label class="auth-label">Password</label>
+            <input class="auth-input" id="loginPassword" type="password" placeholder="••••••••" autocomplete="current-password" />
+          </div>
+          <p class="auth-error" id="loginError"></p>
+          <button class="auth-btn-primary" id="loginSubmitBtn">Log in</button>
+          <p class="auth-switch">Don't have an account? <button class="auth-link" id="switchToSignup">Sign up</button></p>
+          <div class="auth-divider"><span>or</span></div>
+          <button class="auth-btn-secondary" id="guestBtn">Continue as Guest</button>
+        </div>
+
+        <!-- Sign up form -->
+        <div id="authSignupForm" style="display:none;">
+          <div class="auth-brand">
+            <div class="brand-mark" style="width:36px;height:36px;font-size:0.9rem;">VR</div>
+            <span style="font-weight:700;font-size:1rem;color:var(--sidebar-fg);">VerifiableRAG</span>
+          </div>
+          <h2 class="auth-title">Create account</h2>
+          <p class="auth-sub">Your conversations will be saved to your account.</p>
+          <div class="auth-field">
+            <label class="auth-label">Name</label>
+            <input class="auth-input" id="signupName" type="text" placeholder="Your name" autocomplete="name" />
+          </div>
+          <div class="auth-field">
+            <label class="auth-label">Email</label>
+            <input class="auth-input" id="signupEmail" type="email" placeholder="you@example.com" autocomplete="email" />
+          </div>
+          <div class="auth-field">
+            <label class="auth-label">Password</label>
+            <input class="auth-input" id="signupPassword" type="password" placeholder="••••••••" autocomplete="new-password" />
+          </div>
+          <p class="auth-error" id="signupError"></p>
+          <button class="auth-btn-primary" id="signupSubmitBtn">Create account</button>
+          <p class="auth-switch">Already have an account? <button class="auth-link" id="switchToLogin">Log in</button></p>
+          <div class="auth-divider"><span>or</span></div>
+          <button class="auth-btn-secondary" id="guestBtn2">Continue as Guest</button>
+        </div>
+      </div>
+    </div>
+  </nav>
+
+  <!-- ══════════════════════════════════════════
+       MAIN AREA
+  ══════════════════════════════════════════ -->
+  <div class="main-area">
+
+    <!-- Top bar -->
+    <header class="topbar">
+      <button class="sidebar-toggle" id="sidebarToggle" title="Toggle sidebar (⌘/)">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <span class="topbar-title" id="topbarTitle">New conversation</span>
+      <div class="topbar-actions">
+        <button class="topbar-btn" id="exportConvBtn" title="Export conversation as Markdown">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Export
+        </button>
+        <button class="clear-chat-btn" id="clearChatBtn" title="Clear conversation">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M9 6V4h6v2"/></svg>
+          Clear
+        </button>
+      </div>
+    </header>
+
+    <!-- Chat messages -->
+    <div class="chat-scroll" id="chatScroll">
+      <div class="empty-state" id="emptyState">
+        <div class="empty-icon">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+        </div>
+        <h2>Ask anything about your PDF</h2>
+        <p>Select a document from the panel on the right, then type your question below. Every claim in the answer is verified against the source.</p>
+      </div>
+      <div class="chat-messages" id="chatMessages"></div>
+    </div>
+
+    <!-- Composer -->
+    <div class="composer-wrap">
+      <div class="composer">
+        <textarea id="questionInput" rows="1" placeholder="Ask a question about your document…" aria-label="Question"></textarea>
+        <button id="askBtn" class="ask-btn" title="Send">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        </button>
+      </div>
+      <p id="askStatus" class="composer-status"></p>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════
+       RIGHT PANEL  — documents
+  ══════════════════════════════════════════ -->
+  <aside class="doc-panel" id="docPanel">
+    <div class="doc-panel-head">
+      <span class="panel-label">Documents</span>
+      <button id="refreshBtn" class="icon-btn" title="Refresh">⟳</button>
+    </div>
+
+    <!-- Upload -->
+    <div class="upload-area">
+      <label class="file-drop" for="fileInput">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        <span id="fileLabel">Choose a file…</span>
+      </label>
+      <input type="file" id="fileInput"
+        accept=".pdf,.docx,.txt,.md,.markdown,.pptx,.xlsx,.xls,.png,.jpg,.jpeg,.bmp,.tiff,.tif,.webp"
+        hidden />
+      <button id="uploadBtn" class="primary full">Upload &amp; index</button>
+      <p class="supported-types-hint">PDF · DOCX · PPTX · XLSX · TXT · MD · PNG · JPG</p>
+      <p id="uploadStatus" class="status"></p>
+    </div>
+
+    <!-- Document list -->
+    <div class="doc-list-wrap">
+      <div id="docList" class="doc-list" role="listbox" aria-label="Indexed documents"></div>
+      <p class="doc-list-hint">Click to select · Ctrl+click for multi-select · hover for options</p>
+    </div>
+
+    <!-- Active doc banner -->
+    <div id="selectedBanner" class="selected-banner" style="display:none;">
+      <span id="selectedBannerName" class="selected-banner-name"></span>
+      <button id="deselectBtn" class="banner-deselect" title="Deselect all">✕</button>
+    </div>
+    <!-- Summarize button -->
+    <div id="summarizeWrap" class="summarize-wrap" style="display:none;">
+      <select id="summarizeStyle" class="summarize-select">
+        <option value="concise">Concise summary</option>
+        <option value="detailed">Detailed overview</option>
+        <option value="bullets">Key bullet points</option>
+      </select>
+      <button id="summarizeBtn" class="primary full">Summarize document</button>
+    </div>
+  </aside>
+
+</div>
+
+<!-- ── Modals ───────────────────────────────────────────────────────────── -->
+
+<!-- Delete document modal -->
+<div id="deleteDocModal" class="modal-overlay" style="display:none;" role="dialog" aria-modal="true" aria-labelledby="deleteDocTitle">
+  <div class="modal">
+    <h3 class="modal-title" id="deleteDocTitle">Delete document?</h3>
+    <p id="deleteDocMsg" class="modal-msg"></p>
+    <div class="modal-actions">
+      <button id="deleteDocCancelBtn" class="btn-secondary">Cancel</button>
+      <button id="deleteDocConfirmBtn" class="btn-danger">Delete</button>
+    </div>
+  </div>
+</div>
+
+<!-- Delete conversation modal -->
+<div id="deleteConvModal" class="modal-overlay" style="display:none;" role="dialog" aria-modal="true" aria-labelledby="deleteConvTitle">
+  <div class="modal">
+    <h3 class="modal-title" id="deleteConvTitle">Delete conversation?</h3>
+    <p class="modal-msg">This conversation and all its messages will be removed. This cannot be undone.</p>
+    <div class="modal-actions">
+      <button id="deleteConvCancelBtn" class="btn-secondary">Cancel</button>
+      <button id="deleteConvConfirmBtn" class="btn-danger">Delete</button>
+    </div>
+  </div>
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>
