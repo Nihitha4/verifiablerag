@@ -35,17 +35,21 @@ ABSTENTION_PATTERNS = (
 ABSTENTION_REGEX_PATTERNS = [
     r"does not (explicitly )?state",
     r"does not (explicitly )?provide",
-    r"not specified in the document",
+    r"do(es)? not contain",
+    r"do(es)? not (give|mention|report|specify)",
+    r"not specified in the (document|text|passages?)",
     r"not stated in the (document|text|passages?)",
     r"no specific (numeric|percentage|exact) (value|figure|number)",
-    r"passages? (supplied |provided )?do(es)? not (give|mention|state)",
+    r"(passages?|excerpts?|document|text) (supplied |provided )?do(es)? not",
     r"the document does not",
     r"documents? do(es)? not (explicitly )?(state|provide|mention|give|specify)",
     r"(cannot|can't) be (determined|found|verified|confirmed) from (the )?(document|passage|context|text)",
     r"no (information|data|detail|figure|value|mention) (is )?(available|provided|given|found) (in |within )?(the )?(document|passage|context|text)",
+    r"not (available|provided|mentioned|specified|given|reported) in (the )?(document|text|passage|context)",
+    r"(text|document|passage|source) (does not|do not|doesn't) (report|mention|state|give|contain|specify)",
 ]
 
-MAX_CORRECTION_ROUNDS = 1
+MAX_CORRECTION_ROUNDS = int(os.getenv("MAX_CORRECTION_ROUNDS", "0"))
 
 # Character budget for evidence sent to LLM. ~6000 chars ≈ 1500 tokens.
 # Keep well under Groq's 8K context window.
@@ -443,8 +447,8 @@ def _postprocess_verdicts(verdicts: list[dict], evidence_chunks: list[dict]) -> 
             verdict["source_ids"] = []
             verdict["quote"] = ""
         elif absence_claim:
-            verdict["verdict"] = "UNSUPPORTED"
-            verdict["reason"] = "Absence claims cannot be verified from partial context."
+            verdict["verdict"] = "ABSTAINED"
+            verdict["reason"] = "Claim states information is absent — this is an abstention, not a factual assertion."
             verdict["source_ids"] = []
             verdict["quote"] = ""
         elif _looks_like_derived_numeric_claim(claim_text, evidence_chunks):
@@ -541,14 +545,26 @@ def extract_and_verify_claims(answer: str, evidence_chunks: list[dict]) -> list[
         {
             "role": "system",
             "content": (
-                "You are a fact-verification assistant. "
-                "Step 1: split the Answer into short atomic claims (max 20 words each). "
+                "You are a fact-verification assistant.\n"
+                "Step 1: split the Answer into short atomic claims (max 20 words each).\n"
                 "Step 2: for each claim decide SUPPORTED, CONTRADICTED, UNSUPPORTED, or ABSTAINED "
-                "based on the Context. Mark SUPPORTED if the context broadly supports the claim. "
-                "Mark ABSTAINED only when the answer correctly refuses to provide information that cannot be verified from the retrieved passages without asserting unsupported factual content. "
-                "Do not mark a correct abstention as Unsupported. "
-                "Critical rule: do not accept derived numerical claims or inferred percentage changes unless the exact relationship is explicitly stated in the Context. "
-                "If the Context does not give the exact percentage or exact numerical relationship, mark the claim UNSUPPORTED. "
+                "based on the Context. Mark SUPPORTED if the context broadly supports the claim.\n\n"
+                "CRITICAL RULE FOR ABSTAINED CLAIMS:\n"
+                "Before classifying a claim as UNSUPPORTED, first ask: does this sentence assert "
+                "a specific fact that could be true or false? A sentence that states information "
+                "is missing, unavailable, not provided, not specified, or not contained in the "
+                "source (in ANY phrasing -- e.g. 'does not state', 'do not contain', 'no specific "
+                "figure is given', 'not mentioned', 'the text does not report') is NOT asserting "
+                "a fact. It is declining to assert one. Classify any such sentence as ABSTAINED, "
+                "never UNSUPPORTED, regardless of its exact wording.\n"
+                "When you are unsure whether a sentence is an abstention or a factual assertion, "
+                "default to ABSTAINED rather than UNSUPPORTED.\n"
+                "Only use UNSUPPORTED when the claim asserts a specific fact, number, date, or "
+                "relationship that the Context does not contain.\n\n"
+                "Critical rule: do not accept derived numerical claims or inferred percentage "
+                "changes unless the exact relationship is explicitly stated in the Context. "
+                "If the Context does not give the exact percentage or exact numerical relationship, "
+                "mark the claim UNSUPPORTED.\n"
                 "Respond ONLY as compact JSON: "
                 '{"verdicts":[{"claim":"...","verdict":"SUPPORTED","source_ids":["source_1"]},...]}'
             ),

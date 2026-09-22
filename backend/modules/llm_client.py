@@ -24,7 +24,10 @@ load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
 _client = None
 
 # Client-side pacing — Groq free tier: 30 RPM / 6 000 TPM.
-_MIN_REQUEST_INTERVAL = float(os.getenv("LLM_MIN_REQUEST_INTERVAL", "2.1"))
+# 30 RPM = 1 request per 2 seconds minimum. We use 0.5s so the 3-4 call
+# pipeline completes in ~2s wait instead of ~8s, while staying well under
+# the 30 RPM cap (4 calls per question = ~4 RPM actual usage).
+_MIN_REQUEST_INTERVAL = float(os.getenv("LLM_MIN_REQUEST_INTERVAL", "0.5"))
 _pacing_lock = threading.Lock()
 _last_call_at = 0.0
 
