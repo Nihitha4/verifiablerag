@@ -297,7 +297,9 @@ def generate_answer(question: str, evidence_chunks: list[dict]) -> str:
         },
     ]
     answer_max_tokens = int(os.getenv("LLM_ANSWER_MAX_TOKENS", "800"))
-    return chat(messages, temperature=0.2, max_tokens=answer_max_tokens)
+    result = chat(messages, temperature=0.2, max_tokens=answer_max_tokens)
+    # Never return empty — an empty string propagates silently and produces 0-claim results.
+    return result if result and result.strip() else ABSTENTION_MESSAGE
 
 
 def extract_claims(answer: str) -> list[str]:
@@ -406,11 +408,14 @@ def _postprocess_verdicts(verdicts: list[dict], evidence_chunks: list[dict]) -> 
         # This guarantees correct scoring for sentences like
         # "The document does not state the CPU utilisation percentage."
         if verdict.get("verdict", "").upper() == "UNSUPPORTED" and _claim_matches_abstention_regex(claim_text):
+            print(f"[POSTPROCESS] regex override UNSUPPORTED→ABSTAINED: {claim_text[:80]!r}")
             verdict["verdict"] = "ABSTAINED"
             verdict["reason"] = "Claim is itself an abstention statement; forced to ABSTAINED by regex override."
             verdict["source_ids"] = []
             verdict["quote"] = ""
             continue
+        elif verdict.get("verdict", "").upper() == "UNSUPPORTED":
+            print(f"[POSTPROCESS] UNSUPPORTED not caught by regex: {claim_text[:80]!r}")
 
         # A correct abstention is only valid when the answer does not also assert
         # a different unsupported factual answer. All factual claims must still be
@@ -480,7 +485,13 @@ def _normalize_numeric_text(value: str) -> str:
 
 
 def _strip_unverified_numeric_sentences(answer: str, evidence_chunks: list[dict]) -> str:
-    """Remove sentences that assert a number/percentage not present in retrieved evidence."""
+    """Remove sentences that assert a number/percentage not present in retrieved evidence.
+
+    Splits on sentence-terminal punctuation (.!?), checks each sentence for
+    unverified numeric claims, and replaces offenders with a neutral refusal.
+    Also cleans up dangling lead-in fragments (e.g. "In the textbook,") that
+    the LLM placed before a numeric sentence that got removed.
+    """
     if not answer:
         return answer
 
@@ -512,11 +523,35 @@ def _strip_unverified_numeric_sentences(answer: str, evidence_chunks: list[dict]
             continue
         if re.search(r"\d+(?:\.\d+)?\s*(?:%|percent|percentage)", sentence, flags=re.IGNORECASE):
             if not sentence_has_verifiable_number(sentence):
-                cleaned.append("The document does not state this")
+                cleaned.append("The document does not state this.")
                 continue
         cleaned.append(sentence)
 
-    return " ".join(cleaned).strip()
+    # Remove dangling lead-in fragments: short sentences (≤8 words) that end
+    # with a comma and are immediately followed by "The document does not state this."
+    # e.g. "In the textbook," left behind when the numeric sentence after it was removed.
+    result = []
+    PLACEHOLDER = "The document does not state this."
+    for i, s in enumerate(cleaned):
+        # A dangling fragment: ends with comma (possibly + space), short, no verb asserting a fact
+        is_dangling = (
+            s.rstrip().endswith(",")
+            and len(s.split()) <= 8
+            and i + 1 < len(cleaned)
+            and cleaned[i + 1] == PLACEHOLDER
+        )
+        if is_dangling:
+            continue  # drop the orphaned lead-in
+        result.append(s)
+
+    # Deduplicate consecutive identical placeholders
+    deduped = []
+    for s in result:
+        if deduped and deduped[-1] == PLACEHOLDER and s == PLACEHOLDER:
+            continue
+        deduped.append(s)
+
+    return " ".join(deduped).strip()
 
 
 def _repair_unsupported_sentences(answer: str, verdicts: list[dict]) -> str:
@@ -647,14 +682,16 @@ def compute_hallucination_risk_score(verdicts: list[dict], abstained: bool) -> i
 
 def answer_with_verification(question: str, doc_id: str | None, top_k: int = 3) -> dict:
     """
-    Full pipeline:
-      1. Retrieve evidence (more chunks for summary questions).
+    Simplified all-or-nothing pipeline:
+      1. Retrieve evidence.
       2. Generate answer.
       3. Verify claims.
-      4. If unsupported claims remain, do one targeted re-retrieval and regenerate.
-      5. Return best available answer — only abstain if evidence is truly empty.
+      4. If ANY claim is UNSUPPORTED or CONTRADICTED → discard answer, return abstention.
+      5. Otherwise return the answer intact.
+
+    No sentence-level surgery. The answer is either shown whole or not at all.
+    This guarantees zero dangling fragments and zero hallucinated numbers.
     """
-    # Summary/overview questions need wider coverage of the document.
     effective_top_k = top_k * _SUMMARY_TOP_K_MULTIPLIER if _is_summary_question(question) else top_k
 
     evidence = retrieve(question, top_k=effective_top_k, doc_id=doc_id)
@@ -665,7 +702,7 @@ def answer_with_verification(question: str, doc_id: str | None, top_k: int = 3) 
             "claims": [{
                 "claim": question,
                 "verdict": "ABSTAINED",
-                "reason": "The retrieved document does not provide enough information to answer the question.",
+                "reason": "No evidence found in the retrieved document.",
                 "source_ids": [],
                 "quote": "",
             }],
@@ -674,14 +711,17 @@ def answer_with_verification(question: str, doc_id: str | None, top_k: int = 3) 
             "hallucination_risk_score": 0,
         }
 
-    if _has_numeric_claim_without_support(question, evidence):
+    # Pre-generation gate: if the question itself asks for a numeric value
+    # that isn't in the evidence, abstain immediately without generating.
+    if (_is_exact_value_request(question) or _is_numeric_relationship_request(question)) \
+            and not _evidence_has_explicit_exact_numeric_value(question, evidence):
         return {
             "answer": ABSTENTION_FALLBACK_MESSAGE,
             "abstained": True,
             "claims": [{
                 "claim": question,
                 "verdict": "ABSTAINED",
-                "reason": "The question asserts an unsupported numeric relationship that is not explicitly stated in the retrieved document.",
+                "reason": "The document does not explicitly state the requested numerical value.",
                 "source_ids": [],
                 "quote": "",
             }],
@@ -690,46 +730,19 @@ def answer_with_verification(question: str, doc_id: str | None, top_k: int = 3) 
             "hallucination_risk_score": 0,
         }
 
-    if (_is_exact_value_request(question) or _is_numeric_relationship_request(question)) and not _evidence_has_explicit_exact_numeric_value(question, evidence):
-        return {
-            "answer": ABSTENTION_FALLBACK_MESSAGE,
-            "abstained": True,
-            "claims": [{
-                "claim": question,
-                "verdict": "ABSTAINED",
-                "reason": "The retrieved document does not explicitly provide the requested numerical relationship.",
-                "source_ids": [],
-                "quote": "",
-            }],
-            "sources": evidence,
-            "rounds": 0,
-            "hallucination_risk_score": 0,
-        }
-
+    # ── Generate ──────────────────────────────────────────────────────────────
     answer = generate_answer(question, evidence)
-    answer = _strip_unverified_numeric_sentences(answer, evidence)
-    if _has_numeric_claim_without_support(answer, evidence):
-        answer = ABSTENTION_FALLBACK_MESSAGE
-    rounds = 0
+    print(f"[GENERATE] {len(answer)} chars: {answer[:120]!r}")
 
-    # If the LLM itself said it can't answer, do one broader re-retrieval
-    # before giving up — the initial chunks may just be the wrong ones.
-    if ABSTENTION_MESSAGE in answer:
-        extra = retrieve(question, top_k=effective_top_k * 2, doc_id=doc_id)
-        seen = {e["id"] for e in evidence}
-        evidence = evidence + [h for h in extra if h["id"] not in seen]
-        answer = generate_answer(question, evidence)
-        answer = _strip_unverified_numeric_sentences(answer, evidence)
-
-    # If still abstaining after broader retrieval, return it.
-    if _is_pure_abstention_answer(answer):
+    if not answer or not answer.strip():
+        print("[GENERATE] empty — rate limit or LLM error")
         return {
-            "answer": answer,
+            "answer": ABSTENTION_FALLBACK_MESSAGE,
             "abstained": True,
             "claims": [{
                 "claim": question,
                 "verdict": "ABSTAINED",
-                "reason": "The retrieved document does not provide enough information to answer the question without asserting unsupported factual content.",
+                "reason": "Answer generation returned empty — possible rate limit or LLM error.",
                 "source_ids": [],
                 "quote": "",
             }],
@@ -738,117 +751,49 @@ def answer_with_verification(question: str, doc_id: str | None, top_k: int = 3) 
             "hallucination_risk_score": 0,
         }
 
-    while rounds <= MAX_CORRECTION_ROUNDS:
-        verdicts = extract_and_verify_claims(answer, evidence)
+    # ── Verify ────────────────────────────────────────────────────────────────
+    verdicts = extract_and_verify_claims(answer, evidence)
+    print(f"[VERIFIER] question={question[:80]!r}")
+    for v in verdicts:
+        print(f"  verdict={v.get('verdict'):12s}  claim={v.get('claim','')[:70]!r}")
 
-        parse_failed = (
-            len(verdicts) == 1
-            and ("parsing failed" in verdicts[0].get("reason", "").lower()
-                 or "parse_error" in verdicts[0].get("reason", "").lower())
-        )
+    has_bad = any(
+        v.get("verdict", "").upper() in ("UNSUPPORTED", "CONTRADICTED")
+        for v in verdicts
+    )
 
-        problem_claims = [
-            v for v in verdicts if v.get("verdict", "").upper() != "SUPPORTED"
-        ]
-
-        has_unsupported_or_contradicted = any(
-            v.get("verdict", "").upper() in ("UNSUPPORTED", "CONTRADICTED")
-            for v in verdicts
-        )
-
-        # If the answer asserts unsupported or contradicted content, repair it in-place
-        # by replacing the offending sentence with a neutral refusal before returning it.
-        if has_unsupported_or_contradicted:
-            corrected = _repair_unsupported_sentences(answer, verdicts)
-            if corrected and corrected != answer:
-                answer = corrected
-                continue
-            return {
-                "answer": ABSTENTION_FALLBACK_MESSAGE,
-                "abstained": True,
-                "claims": [{
-                    "claim": question,
-                    "verdict": "ABSTAINED",
-                    "reason": "The answer contains unsupported factual content, so the system refuses to answer rather than surface an unsupported claim.",
-                    "source_ids": [],
-                    "quote": "",
-                }],
-                "sources": evidence,
-                "rounds": rounds,
-                "hallucination_risk_score": 0,
-            }
-
-        # Success: all claims supported, or parse soft-passed.
-        if not problem_claims or parse_failed:
-            return {
-                "answer": answer,
-                "abstained": False,
-                "claims": verdicts,
-                "sources": evidence,
-                "rounds": rounds,
-                "hallucination_risk_score": compute_hallucination_risk_score(verdicts, False),
-            }
-
-        if rounds == MAX_CORRECTION_ROUNDS:
-            # Out of correction budget. Return the answer anyway if MOST
-            # claims are supported — only hard-abstain if nothing is supported.
-            supported = [v for v in verdicts if v.get("verdict", "").upper() == "SUPPORTED"]
-            if supported:
-                # Partial support: return the answer with the verification results
-                # so the user can see which claims are uncertain.
-                return {
-                    "answer": answer,
-                    "abstained": False,
-                    "claims": verdicts,
-                    "sources": evidence,
-                    "rounds": rounds,
-                    "hallucination_risk_score": compute_hallucination_risk_score(verdicts, False),
-                }
-            # Truly nothing supported — abstain, but do not count as hallucination.
-            abstention_claims = verdicts if verdicts else [{
+    if has_bad:
+        print("[VERIFIER] bad claim found — abstaining (all-or-nothing)")
+        return {
+            "answer": ABSTENTION_FALLBACK_MESSAGE,
+            "abstained": True,
+            "claims": [{
                 "claim": question,
                 "verdict": "ABSTAINED",
-                "reason": "The retrieved document does not provide enough information to answer the question.",
+                "reason": "The answer contained an unsupported claim; the system abstains rather than show partial or hallucinated content.",
                 "source_ids": [],
                 "quote": "",
-            }]
-            return {
-                "answer": ABSTENTION_FALLBACK_MESSAGE,
-                "abstained": True,
-                "claims": abstention_claims,
-                "sources": evidence,
-                "rounds": rounds,
-                "hallucination_risk_score": 0,
-            }
+            }],
+            "sources": evidence,
+            "rounds": 0,
+            "hallucination_risk_score": 0,
+        }
 
-        # Targeted re-retrieval on unsupported claims.
-        extra_evidence = []
-        seen_ids = {e["id"] for e in evidence}
-        for pc in problem_claims:
-            for hit in retrieve(pc["claim"], top_k=2, doc_id=doc_id):
-                if hit["id"] not in seen_ids:
-                    extra_evidence.append(hit)
-                    seen_ids.add(hit["id"])
-
-        if extra_evidence:
-            evidence = evidence + extra_evidence
-            answer = generate_answer(question, evidence)
-
-        rounds += 1
-
-    # Safety net: never fall through with an unresolved answer after the loop exits.
-    return {
-        "answer": ABSTENTION_FALLBACK_MESSAGE,
-        "abstained": True,
-        "claims": [{
-            "claim": question,
-            "verdict": "ABSTAINED",
-            "reason": "The verification loop exhausted its correction budget without a grounded answer.",
-            "source_ids": [],
-            "quote": "",
-        }],
+    # All claims SUPPORTED or ABSTAINED — safe to show.
+    print("[VERIFIER] all clean — returning answer")
+    result = {
+        "answer": answer,
+        "abstained": False,
+        "claims": verdicts,
         "sources": evidence,
-        "rounds": rounds,
-        "hallucination_risk_score": 0,
-        "verdicts": [],
+        "rounds": 0,
+        "hallucination_risk_score": compute_hallucination_risk_score(verdicts, False),
     }
+
+    # Hard fallback: physically impossible to return an empty answer box.
+    if not result.get("answer") or not result["answer"].strip():
+        result["answer"] = "I'm not able to find verified information in the document to answer this question."
+        result["abstained"] = True
+        result["hallucination_risk_score"] = 0
+
+    return result

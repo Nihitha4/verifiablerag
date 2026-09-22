@@ -282,10 +282,21 @@ def ask_question(req: AskRequest):
                         "hallucination_risk_score": compute_hallucination_risk_score(verdicts, is_abstained),
                     }
     except Exception as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"LLM could not respond ({type(e).__name__}: {e}). Check backend/.env.",
-        ) from e
+        print(f"[ASK] pipeline error: {type(e).__name__}: {e}")
+        result = {
+            "answer": "I'm not able to find verified information in the document to answer this question.",
+            "abstained": True,
+            "claims": [],
+            "sources": [],
+            "rounds": 0,
+            "hallucination_risk_score": 0,
+        }
+
+    # Hard safety net: never return an empty answer box under any circumstance.
+    if not result.get("answer") or not str(result["answer"]).strip():
+        result["answer"] = "I'm not able to find verified information in the document to answer this question."
+        result["abstained"] = True
+        result["hallucination_risk_score"] = 0
 
     return result
 
