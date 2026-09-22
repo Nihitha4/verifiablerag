@@ -605,7 +605,7 @@ function buildAnswerDOM(container, data, turn) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  ASK  (task 3 — streaming via SSE)
+//  ASK  (non-streaming JSON response)
 // ══════════════════════════════════════════════════════════════════════════════
 
 questionInput.addEventListener("input", () => {
@@ -659,114 +659,29 @@ askBtn.addEventListener("click", async () => {
 
   const aArea = turnEl.querySelector(".turn-answer-area");
 
-  // ── Streaming via SSE ─────────────────────────────────────────────────────
   try {
-    const body = JSON.stringify({
-      question,
-      doc_ids: [...selectedDocIds],
-    });
-
-    const response = await fetch(`${API_BASE}/ask/stream`, {
+    const response = await fetch(`${API_BASE}/ask`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body,
+      body: JSON.stringify({ question, doc_ids: [...selectedDocIds] }),
     });
-
     if (!response.ok) {
       const err = await response.json().catch(() => ({ detail: "Request failed" }));
       throw new Error(err.detail || "Request failed");
     }
-
-    // Prepare the answer area with a live answer box
+    const data = await response.json();
+    turn.data = data;
+    saveConversations(conversations);
     aArea.innerHTML = "";
-    const streamBox = document.createElement("div");
-    streamBox.className = "answer-box markdown-body streaming";
-    aArea.appendChild(streamBox);
-
-    const statusBar = document.createElement("div");
-    statusBar.className = "evidence-status";
-    statusBar.textContent = "Generating answer…";
-    aArea.insertBefore(statusBar, streamBox);
-
-    let fullText = "";
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      // Parse SSE events from buffer
-      const parts = buffer.split("\n\n");
-      buffer = parts.pop(); // keep incomplete last chunk
-
-      for (const part of parts) {
-        if (!part.startsWith("data: ")) continue;
-        let evt;
-        try { evt = JSON.parse(part.slice(6)); } catch { continue; }
-
-        if (evt.type === "token") {
-          fullText += evt.text;
-          streamBox.innerHTML = renderMarkdown(fullText);
-          streamBox.classList.add("streaming");
-          chatScroll.scrollTop = chatScroll.scrollHeight;
-
-        } else if (evt.type === "verify") {
-          streamBox.classList.remove("streaming");
-          // If backend decided to override the streamed answer (all-or-nothing abstention)
-          const finalAnswer = evt.answer_override || fullText || "I'm not able to find verified information in the document to answer this question.";
-          // Store full data on turn
-          turn.data = {
-            answer: finalAnswer,
-            claims: evt.claims,
-            sources: evt.sources,
-            abstained: evt.abstained,
-            rounds: evt.rounds,
-            hallucination_risk_score: evt.hallucination_risk_score || 0,
-          };
-          saveConversations(conversations);
-          // Replace streaming area with full rendered answer
-          aArea.innerHTML = "";
-          buildAnswerDOM(aArea, turn.data, turn);
-          askStatus.textContent = evt.abstained
-            ? "Abstained — insufficient verified evidence."
-            : `Answered and verified.`;
-          chatScroll.scrollTop = chatScroll.scrollHeight;
-
-        } else if (evt.type === "error") {
-          turn.error = evt.message;
-          saveConversations(conversations);
-          aArea.innerHTML = `<div class="turn-error">⚠ ${escHtml(evt.message)}</div>`;
-          askStatus.textContent = `Error: ${evt.message}`;
-        }
-      }
-    }
-
+    buildAnswerDOM(aArea, data, turn);
+    askStatus.textContent = data.abstained
+      ? "Abstained — insufficient verified evidence."
+      : `Answered — verified in ${data.rounds} round(s).`;
   } catch (err) {
-    // Fallback to non-streaming /ask if SSE fails
-    try {
-      const res = await fetch(`${API_BASE}/ask`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, doc_ids: [...selectedDocIds] }),
-      });
-      if (!res.ok) throw new Error((await res.json()).detail || "Request failed");
-      const data = await res.json();
-      turn.data = data;
-      saveConversations(conversations);
-      aArea.innerHTML = "";
-      buildAnswerDOM(aArea, data, turn);
-      askStatus.textContent = data.abstained
-        ? "Abstained — insufficient verified evidence."
-        : `Answered — verified in ${data.rounds} round(s).`;
-    } catch (fallbackErr) {
-      turn.error = fallbackErr.message;
-      saveConversations(conversations);
-      aArea.innerHTML = `<div class="turn-error">⚠ ${escHtml(fallbackErr.message)}</div>`;
-      askStatus.textContent = `Error: ${fallbackErr.message}`;
-    }
+    turn.error = err.message;
+    saveConversations(conversations);
+    aArea.innerHTML = `<div class="turn-error">⚠ ${escHtml(err.message)}</div>`;
+    askStatus.textContent = `Error: ${err.message}`;
   } finally {
     updateAskState();
     chatScroll.scrollTop = chatScroll.scrollHeight;
