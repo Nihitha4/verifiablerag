@@ -202,12 +202,26 @@ def _extract_image(path: str) -> list[dict]:
         from modules.llm_client import vision_chat
 
         vision_prompt = (
-            "You are an expert document analyst. Carefully examine this image and:\n"
-            "1. Transcribe ALL text visible in the image exactly as it appears.\n"
-            "2. Describe any charts, diagrams, tables, or figures in detail.\n"
-            "3. Note any headings, labels, captions, or annotations.\n"
-            "4. Include every piece of information visible — do not summarise or skip anything.\n\n"
-            "Format your response as plain text, preserving the logical structure of the content."
+            "You are transcribing the visible content of an image for a document search index. "
+            "Your output will be used as evidence text that other claims must be verified against, "
+            "so accuracy is critical.\n\n"
+            "Rules:\n"
+            "1. Describe ONLY what is literally visible in the image: text, labels, numbers, "
+            "buttons, UI elements, and headings.\n"
+            "2. Transcribe all readable text exactly as it appears, including URLs, prices, "
+            "percentages, usernames, and button labels. Preserve exact spelling and capitalization.\n"
+            "3. Do NOT infer purpose, meaning, context, or intent. Do not guess what the image "
+            "is for or what app/company it belongs to beyond what is explicitly written on screen.\n"
+            "4. Do NOT add explanatory commentary, interpretation, or conclusions.\n"
+            "5. If text is cut off, blurry, or partially visible, mark it as [illegible] or "
+            "[partial: \"...\"] rather than guessing or completing it.\n"
+            "6. Describe layout only when necessary to disambiguate repeated labels, such as "
+            "left panel or right panel.\n"
+            "7. Output plain text only. Do not use markdown formatting, interpretation bullets, "
+            "or a summary paragraph.\n"
+            "8. If the image contains no readable text, such as a pure photo or illustration, "
+            "describe only the literal visible objects or scene in one factual sentence, with "
+            "nothing symbolic or interpretive."
         )
 
         text = vision_chat(path, vision_prompt, max_tokens=1500)
