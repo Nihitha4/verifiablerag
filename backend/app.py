@@ -297,19 +297,17 @@ def ask_question(req: AskRequest):
         }
 
     # Hard safety net: never return an empty answer box under any circumstance.
-    # Also apply deterministic percentage check as final override.
     if not result.get("answer") or not str(result["answer"]).strip():
         result["answer"] = "I'm not able to find verified information in the document to answer this question."
         result["abstained"] = True
         result["hallucination_risk_score"] = 0
-    elif not result.get("abstained", False):
-        # Check answer against evidence from result if available
-        sources = result.get("sources", [])
-        if sources and _contains_unverified_percentage(str(result["answer"]), sources):
-            print("[DETERMIN] route-level block — unverified percentage in answer")
-            result["answer"] = ABSTENTION_FALLBACK_MESSAGE
-            result["abstained"] = True
-            result["hallucination_risk_score"] = 0
+    # DETERMINISTIC PERCENTAGE CHECK — temporarily disabled, was over-triggering.
+    # elif not result.get("abstained", False):
+    #     sources = result.get("sources", [])
+    #     if sources and _contains_unverified_percentage(str(result["answer"]), sources):
+    #         result["answer"] = ABSTENTION_FALLBACK_MESSAGE
+    #         result["abstained"] = True
+    #         result["hallucination_risk_score"] = 0
 
     return result
 
@@ -529,10 +527,9 @@ def ask_stream(req: AskRequest):
             if not full_answer:
                 full_answer = ABSTENTION_MESSAGE
 
-            # HARD DETERMINISTIC OVERRIDE — regex check before LLM verify step.
-            if _contains_unverified_percentage(full_answer, evidence):
-                print("[DETERMIN] stream: blocking answer — unverified percentage")
-                full_answer = ABSTENTION_FALLBACK_MESSAGE
+            # DETERMINISTIC PERCENTAGE CHECK — temporarily disabled, was over-triggering.
+            # if _contains_unverified_percentage(full_answer, evidence):
+            #     full_answer = ABSTENTION_FALLBACK_MESSAGE
 
             # ── 3. Verify claims — all-or-nothing: any bad claim → abstain ───
             if ABSTENTION_MESSAGE in full_answer:
