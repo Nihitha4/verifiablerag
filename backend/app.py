@@ -260,6 +260,8 @@ def ask_question(req: AskRequest):
                     ABSTENTION_MESSAGE, MAX_CORRECTION_ROUNDS,
                 )
                 answer = generate_answer(req.question, evidence)
+                if not answer or not answer.strip():
+                    answer = "I'm not able to find verified information in the document to answer this question."
                 if ABSTENTION_MESSAGE in answer:
                     result = {"answer": answer, "abstained": True, "claims": [], "sources": evidence, "rounds": 0, "hallucination_risk_score": 0}
                 else:
@@ -516,7 +518,7 @@ def ask_stream(req: AskRequest):
             if not full_answer:
                 full_answer = ABSTENTION_MESSAGE
 
-            # ── 3. Verify claims (non-streaming, send single event) ───────────
+            # ── 3. Verify claims — all-or-nothing: any bad claim → abstain ───
             if ABSTENTION_MESSAGE in full_answer:
                 yield event({
                     "type": "verify",
@@ -524,17 +526,42 @@ def ask_stream(req: AskRequest):
                     "sources": evidence,
                     "abstained": True,
                     "rounds": 0,
+                    "hallucination_risk_score": 0,
                 })
             else:
                 verdicts = extract_and_verify_claims(full_answer, evidence)
-                supported = [v for v in verdicts if v.get("verdict", "").upper() == "SUPPORTED"]
-                yield event({
-                    "type": "verify",
-                    "claims": verdicts,
-                    "sources": evidence,
-                    "abstained": not bool(supported),
-                    "rounds": 0,
-                })
+                has_bad = any(
+                    v.get("verdict", "").upper() in ("UNSUPPORTED", "CONTRADICTED")
+                    for v in verdicts
+                )
+                if has_bad:
+                    # Discard answer — show abstention instead of hallucinated content.
+                    # Patch the already-streamed text box via a replace token.
+                    yield event({"type": "token", "text": "", "replace": ABSTENTION_FALLBACK_MESSAGE})
+                    yield event({
+                        "type": "verify",
+                        "claims": [{
+                            "claim": req.question,
+                            "verdict": "ABSTAINED",
+                            "reason": "Answer contained unsupported claims; system abstains.",
+                            "source_ids": [],
+                            "quote": "",
+                        }],
+                        "sources": evidence,
+                        "abstained": True,
+                        "rounds": 0,
+                        "hallucination_risk_score": 0,
+                        "answer_override": ABSTENTION_FALLBACK_MESSAGE,
+                    })
+                else:
+                    yield event({
+                        "type": "verify",
+                        "claims": verdicts,
+                        "sources": evidence,
+                        "abstained": False,
+                        "rounds": 0,
+                        "hallucination_risk_score": compute_hallucination_risk_score(verdicts, False),
+                    })
 
             yield event({"type": "done"})
 

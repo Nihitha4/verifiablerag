@@ -715,13 +715,16 @@ askBtn.addEventListener("click", async () => {
 
         } else if (evt.type === "verify") {
           streamBox.classList.remove("streaming");
+          // If backend decided to override the streamed answer (all-or-nothing abstention)
+          const finalAnswer = evt.answer_override || fullText || "I'm not able to find verified information in the document to answer this question.";
           // Store full data on turn
           turn.data = {
-            answer: fullText,
+            answer: finalAnswer,
             claims: evt.claims,
             sources: evt.sources,
             abstained: evt.abstained,
             rounds: evt.rounds,
+            hallucination_risk_score: evt.hallucination_risk_score || 0,
           };
           saveConversations(conversations);
           // Replace streaming area with full rendered answer
