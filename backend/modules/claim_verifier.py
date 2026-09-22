@@ -651,6 +651,30 @@ def extract_and_verify_claims(answer: str, evidence_chunks: list[dict]) -> list[
     return _detect_cross_doc_contradictions(processed, evidence_chunks)
 
 
+def _contains_unverified_percentage(answer: str, evidence_chunks: list[dict]) -> bool:
+    """
+    Deterministic, non-LLM check: find every percentage figure in the answer.
+    If any does not appear verbatim (same digits near % or 'percent') in the
+    evidence text, the whole answer is treated as unsupported.
+
+    This cannot be fooled by prompt-following failures — it's plain regex.
+    """
+    percentages_in_answer = re.findall(r"\d+\s*(?:%|percent)", answer, re.IGNORECASE)
+    if not percentages_in_answer:
+        return False  # no numeric claim to check
+
+    evidence_text = " ".join(chunk.get("text", "") for chunk in evidence_chunks)
+
+    for pct in percentages_in_answer:
+        digits = re.search(r"\d+", pct).group()
+        pattern = rf"{digits}\s*(?:%|percent)"
+        if not re.search(pattern, evidence_text, re.IGNORECASE):
+            print(f"[DETERMIN] percentage {digits}% not found in evidence — blocking answer")
+            return True  # digit not in evidence → unsupported
+
+    return False
+
+
 def compute_hallucination_risk_score(verdicts: list[dict], abstained: bool) -> int:
     """
     Return an integer 0–100 representing hallucination risk.
@@ -781,14 +805,34 @@ def answer_with_verification(question: str, doc_id: str | None, top_k: int = 3) 
 
     # All claims SUPPORTED or ABSTAINED — safe to show.
     print("[VERIFIER] all clean — returning answer")
-    result = {
-        "answer": answer,
-        "abstained": False,
-        "claims": verdicts,
-        "sources": evidence,
-        "rounds": 0,
-        "hallucination_risk_score": compute_hallucination_risk_score(verdicts, False),
-    }
+
+    # HARD DETERMINISTIC OVERRIDE — does not trust the LLM verifier's judgment.
+    # If the answer contains any percentage not present in the evidence, block it.
+    if _contains_unverified_percentage(answer, evidence):
+        print("[DETERMIN] blocking answer — unverified percentage detected")
+        result = {
+            "answer": ABSTENTION_FALLBACK_MESSAGE,
+            "abstained": True,
+            "claims": [{
+                "claim": answer[:120],
+                "verdict": "ABSTAINED",
+                "reason": "Answer contains a percentage figure not found in the retrieved evidence.",
+                "source_ids": [],
+                "quote": "",
+            }],
+            "sources": evidence,
+            "rounds": 0,
+            "hallucination_risk_score": 0,
+        }
+    else:
+        result = {
+            "answer": answer,
+            "abstained": False,
+            "claims": verdicts,
+            "sources": evidence,
+            "rounds": 0,
+            "hallucination_risk_score": compute_hallucination_risk_score(verdicts, False),
+        }
 
     # Hard fallback: physically impossible to return an empty answer box.
     if not result.get("answer") or not result["answer"].strip():
