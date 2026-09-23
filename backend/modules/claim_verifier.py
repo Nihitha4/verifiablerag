@@ -223,6 +223,23 @@ def _is_numeric_relationship_request(question: str) -> bool:
     )
 
 
+def _is_procedural_question(question: str) -> bool:
+    """Return True when the user asks for instructions or a sequence of steps."""
+    q = question.strip().lower()
+    if not q:
+        return False
+    return any(
+        re.search(pattern, q)
+        for pattern in [
+            r"\bhow\s+(?:do|does|did|can|should|to)\b",
+            r"\bwhat\s+are\s+the\s+(?:steps|procedures?|instructions?)\b",
+            r"\b(?:steps?|procedure|instructions?|protocol|workflow|process|method)\b",
+            r"\bwalk me through\b",
+            r"\bguide me\b",
+        ]
+    )
+
+
 def _has_numeric_claim_without_support(text: str, evidence_chunks: list[dict]) -> bool:
     """Return True when the text asserts a numeric relationship not explicitly grounded in evidence."""
     if not text:
@@ -277,6 +294,12 @@ def generate_answer(question: str, evidence_chunks: list[dict]) -> str:
             "content": (
                 "You are a document-grounded QA assistant. Answer the question using ONLY "
                 "the passages provided below.\n\n"
+                "Never fill gaps with common practice, background knowledge, or plausible "
+                "steps. This is especially important for step-by-step, procedural, method, "
+                "protocol, workflow, and 'how do I' questions: include a step only when the "
+                "passages explicitly describe or support that step. If the passages do not "
+                "contain the requested procedure, say exactly that the document does not "
+                "state the procedure and do not provide a substitute procedure.\n\n"
                 "For general, descriptive, or conceptual questions (definitions, explanations, "
                 "comparisons, purposes, differences) — answer normally and fully if the passages "
                 "contain the relevant information. Do not refuse or hedge on these unless the "
@@ -572,10 +595,21 @@ def _repair_unsupported_sentences(answer: str, verdicts: list[dict]) -> str:
     return " ".join(repaired).strip()
 
 
-def extract_and_verify_claims(answer: str, evidence_chunks: list[dict]) -> list[dict]:
+def extract_and_verify_claims(
+    answer: str,
+    evidence_chunks: list[dict],
+    question: str = "",
+) -> list[dict]:
     """Split answer into claims and verify each against evidence in one LLM call."""
     answer = _strip_unverified_numeric_sentences(answer, evidence_chunks)
     context = _format_evidence(evidence_chunks)
+    procedural_instruction = (
+        "For procedural questions, mark every step UNSUPPORTED unless the Context "
+        "explicitly describes that step. Do not treat general domain knowledge or "
+        "a plausible sequence as support.\n"
+        if _is_procedural_question(question)
+        else ""
+    )
     messages = [
         {
             "role": "system",
@@ -600,7 +634,8 @@ def extract_and_verify_claims(answer: str, evidence_chunks: list[dict]) -> list[
                 "changes unless the exact relationship is explicitly stated in the Context. "
                 "If the Context does not give the exact percentage or exact numerical relationship, "
                 "mark the claim UNSUPPORTED.\n"
-                "Respond ONLY as compact JSON: "
+                + procedural_instruction
+                + "Respond ONLY as compact JSON: "
                 '{"verdicts":[{"claim":"...","verdict":"SUPPORTED","source_ids":["source_1"]},...]}'
             ),
         },
@@ -775,22 +810,44 @@ def answer_with_verification(question: str, doc_id: str | None, top_k: int = 3) 
             "hallucination_risk_score": 0,
         }
 
-    # ── Verify (informational only — does not block display) ──────────────────
-    print(f"[GENERATE] trusted directly, skipping verifier gate for: {question[:80]!r}")
-    verdicts = []
+    # ── Verify (all-or-nothing safety gate) ────────────────────────────────────
+    # Never display a generated answer unless every factual claim is grounded.
+    # This is particularly important for procedural questions, where an LLM can
+    # otherwise turn a missing procedure into plausible-looking instructions.
+    verdicts = extract_and_verify_claims(answer, evidence, question=question)
+    has_bad_claim = any(
+        v.get("verdict", "").upper() in ("UNSUPPORTED", "CONTRADICTED")
+        for v in verdicts
+    )
+    if has_bad_claim or not verdicts:
+        return {
+            "answer": ABSTENTION_FALLBACK_MESSAGE,
+            "abstained": True,
+            "claims": verdicts or [{
+                "claim": answer,
+                "verdict": "UNSUPPORTED",
+                "reason": "The answer could not be grounded in the retrieved evidence.",
+                "source_ids": [],
+                "quote": "",
+            }],
+            "sources": evidence,
+            "rounds": 0,
+            "hallucination_risk_score": 0,
+        }
 
-    # DETERMINISTIC PERCENTAGE CHECK — temporarily disabled, was over-triggering.
-    # Root cause: evidence_chunks key structure needs verification before re-enabling.
-    # if _contains_unverified_percentage(answer, evidence):
-    #     ...
+    # If the answer is a refusal, preserve the refusal rather than treating it
+    # as a factual answer.
+    is_abstained = all(
+        v.get("verdict", "").upper() == "ABSTAINED" for v in verdicts
+    )
 
     result = {
         "answer": answer,
-        "abstained": False,
+        "abstained": is_abstained,
         "claims": verdicts,
         "sources": evidence,
         "rounds": 0,
-        "hallucination_risk_score": compute_hallucination_risk_score(verdicts, False),
+        "hallucination_risk_score": compute_hallucination_risk_score(verdicts, is_abstained),
     }
 
     # Hard fallback: physically impossible to return an empty answer box.

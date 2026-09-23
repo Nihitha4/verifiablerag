@@ -57,7 +57,7 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "2000"))
 TOP_K      = int(os.getenv("TOP_K", "3"))
 # Cap chunks per document to keep indexing fast even for 800-page textbooks.
 # 300 chunks × 2000 chars covers ~600 000 chars = ~400 pages of dense text.
-MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "300"))
+MAX_CHUNKS = int(os.getenv("MAX_CHUNKS", "5000"))
 
 
 @asynccontextmanager
@@ -267,24 +267,33 @@ def ask_question(req: AskRequest):
                 if ABSTENTION_MESSAGE in answer:
                     result = {"answer": answer, "abstained": True, "claims": [], "sources": evidence, "rounds": 0, "hallucination_risk_score": 0}
                 else:
-                    verdicts = extract_and_verify_claims(answer, evidence)
+                    verdicts = extract_and_verify_claims(answer, evidence, question=req.question)
                     supported = [v for v in verdicts if v.get("verdict", "").upper() == "SUPPORTED"]
                     has_bad = any(
                         v.get("verdict", "").upper() in ("UNSUPPORTED", "CONTRADICTED")
                         for v in verdicts
                     )
-                    # Only treat as abstained when there are no supported claims AND
-                    # no unsupported/contradicted ones (i.e. everything is ABSTAINED).
-                    # ABSTAINED claims must NOT be counted as unsupported.
-                    is_abstained = not bool(supported) and not has_bad
-                    result = {
-                        "answer": answer,
-                        "abstained": is_abstained,
-                        "claims": verdicts,
-                        "sources": evidence,
-                        "rounds": 0,
-                        "hallucination_risk_score": compute_hallucination_risk_score(verdicts, is_abstained),
-                    }
+                    if has_bad:
+                        result = {
+                            "answer": ABSTENTION_FALLBACK_MESSAGE,
+                            "abstained": True,
+                            "claims": verdicts,
+                            "sources": evidence,
+                            "rounds": 0,
+                            "hallucination_risk_score": 0,
+                        }
+                    else:
+                        # Only treat as abstained when there are no supported claims
+                        # and no unsupported/contradicted ones.
+                        is_abstained = not bool(supported)
+                        result = {
+                            "answer": answer,
+                            "abstained": is_abstained,
+                            "claims": verdicts,
+                            "sources": evidence,
+                            "rounds": 0,
+                            "hallucination_risk_score": compute_hallucination_risk_score(verdicts, is_abstained),
+                        }
     except Exception as e:
         print(f"[ASK] pipeline error: {type(e).__name__}: {e}")
         result = {
@@ -542,7 +551,7 @@ def ask_stream(req: AskRequest):
                     "hallucination_risk_score": 0,
                 })
             else:
-                verdicts = extract_and_verify_claims(full_answer, evidence)
+                verdicts = extract_and_verify_claims(full_answer, evidence, question=req.question)
                 has_bad = any(
                     v.get("verdict", "").upper() in ("UNSUPPORTED", "CONTRADICTED")
                     for v in verdicts
