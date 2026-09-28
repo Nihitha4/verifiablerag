@@ -311,19 +311,33 @@ function buildAnswerDOM(container, data, turn) {
   const isCorrectAbstention = counts.abstained > 0 && !hasUnsupportedOrContradicted;
   const isFullySupported = counts.supported > 0 && counts.unsupported === 0 && counts.contradicted === 0;
 
-  let riskLabel;
-  if (hasUnsupportedOrContradicted) {
-    riskLabel = "Hallucination Risk: High";
-  } else if (counts.unsupported === 0 && counts.contradicted === 0 && counts.abstained === 0) {
-    riskLabel = "Hallucination Risk: None";
-  } else {
-    riskLabel = "Hallucination Risk: Low";
-  }
-  if (isCorrectAbstention) {
-    riskLabel = "Hallucination Risk: None";
+  const totalClaims = counts.supported + counts.unsupported + counts.contradicted + counts.abstained;
+  const badClaims = counts.unsupported + counts.contradicted;
+  const hallucinationPct = data.hallucination_percentage !== undefined
+    ? Math.round(data.hallucination_percentage)
+    : (totalClaims > 0 ? Math.round((badClaims / totalClaims) * 100) : 0);
+
+  let riskTierText = "Low";
+  let scoreLevel = "low";
+  if (hallucinationPct > 70) {
+    riskTierText = "Critical";
+    scoreLevel = "high";
+  } else if (hallucinationPct > 40) {
+    riskTierText = "High";
+    scoreLevel = "high";
+  } else if (hallucinationPct > 15) {
+    riskTierText = "Moderate";
+    scoreLevel = "high";
+  } else if (hallucinationPct === 0) {
+    riskTierText = "None";
+    scoreLevel = "low";
   }
 
-  const scoreLevel = hasUnsupportedOrContradicted ? "high" : "low";
+  let riskLabel = `Hallucination Risk: ${hallucinationPct}% (${riskTierText})`;
+  if (isCorrectAbstention) {
+    riskLabel = "Hallucination Risk: 0% (Correct Abstention)";
+    scoreLevel = "low";
+  }
 
   const factualClaims = (data.claims || []).filter(c => {
     const v = (c.verdict || "").toUpperCase();
@@ -344,9 +358,19 @@ function buildAnswerDOM(container, data, turn) {
     <span class="pill pill-contradicted">Contradicted: ${counts.contradicted}</span>
     <span class="pill pill-abstained">Correct Abstention: ${counts.abstained}</span>
     <span class="pill pill-risk pill-risk-${scoreLevel}" title="${riskLabel}">
-      🎯 ${riskLabel}
+      🎯 Hallucination Risk: ${hallucinationPct}%
     </span>
     ${citationBadge}`;
+
+  // Audit in Checker button
+  const auditBtn = document.createElement("button");
+  auditBtn.className = "answer-action-btn";
+  auditBtn.title = "Audit this answer in LLM Hallucination Checker";
+  auditBtn.innerHTML = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 11 12 14 22 4"/></svg>`;
+  auditBtn.addEventListener("click", () => {
+    switchToHallucinationChecker(data.answer || "", turn?.q || "");
+  });
+  header.appendChild(auditBtn);
 
   // Copy button  (task 5)
   const copyBtn = document.createElement("button");
@@ -854,6 +878,7 @@ function deselectAllDocs() {
 }
 
 function updateSelectedBanner() {
+  if (typeof updateCheckerDocStatus === "function") updateCheckerDocStatus();
   const count = selectedDocIds.size;
   if (count === 0) {
     selectedBanner.style.display = "none";
@@ -1216,3 +1241,641 @@ if (conversations.length > 0) {
 
 refreshDocuments();
 updateAskState();
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  LLM HALLUCINATION CHECKER & AUDITOR WORKSPACE
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── DOM References ──
+const tabRagChat              = document.getElementById("tabRagChat");
+const tabHallucinationChecker  = document.getElementById("tabHallucinationChecker");
+const chatTopbarActions       = document.getElementById("chatTopbarActions");
+const checkerTopbarActions    = document.getElementById("checkerTopbarActions");
+const composerWrap            = document.getElementById("composerWrap");
+const hallucinationWorkspace  = document.getElementById("hallucinationWorkspace");
+
+const sampleHallucinatedBtn   = document.getElementById("sampleHallucinatedBtn");
+const sampleGroundedBtn       = document.getElementById("sampleGroundedBtn");
+const clearAnswerBtn          = document.getElementById("clearAnswerBtn");
+
+const externalAnswerInput     = document.getElementById("externalAnswerInput");
+const externalPromptInput     = document.getElementById("externalPromptInput");
+const answerWordCount         = document.getElementById("answerWordCount");
+
+const refModeDocs             = document.getElementById("refModeDocs");
+const refModeText             = document.getElementById("refModeText");
+const refModeBoth             = document.getElementById("refModeBoth");
+const refDocsContainer        = document.getElementById("refDocsContainer");
+const refTextContainer        = document.getElementById("refTextContainer");
+const refDocStatusBanner      = document.getElementById("refDocStatusBanner");
+const refDocStatusText        = document.getElementById("refDocStatusText");
+const customReferenceInput    = document.getElementById("customReferenceInput");
+const referenceWordCount      = document.getElementById("referenceWordCount");
+
+const runHallucinationCheckBtn = document.getElementById("runHallucinationCheckBtn");
+const auditStatusMsg          = document.getElementById("auditStatusMsg");
+
+const auditResults            = document.getElementById("auditResults");
+const scoreboardCard          = document.getElementById("scoreboardCard");
+const scoreCircle             = document.getElementById("scoreCircle");
+const scoreNumber             = document.getElementById("scoreNumber");
+const riskBadge               = document.getElementById("riskBadge");
+const scoreTimestamp          = document.getElementById("scoreTimestamp");
+const scoreHeadline           = document.getElementById("scoreHeadline");
+const scoreSummary            = document.getElementById("scoreSummary");
+const riskProgressBar         = document.getElementById("riskProgressBar");
+
+const metricHallucinationPct  = document.getElementById("metricHallucinationPct");
+const metricHallucinationSub  = document.getElementById("metricHallucinationSub");
+const metricSupportedPct      = document.getElementById("metricSupportedPct");
+const metricSupportedSub      = document.getElementById("metricSupportedSub");
+const metricUnsupportedPct    = document.getElementById("metricUnsupportedPct");
+const metricUnsupportedSub    = document.getElementById("metricUnsupportedSub");
+const metricContradictedPct   = document.getElementById("metricContradictedPct");
+const metricContradictedSub   = document.getElementById("metricContradictedSub");
+
+const sentenceHeatmap         = document.getElementById("sentenceHeatmap");
+const auditClaimsList         = document.getElementById("auditClaimsList");
+
+const filterAllBtn            = document.getElementById("filterAllBtn");
+const filterBadBtn            = document.getElementById("filterBadBtn");
+const filterSuppBtn           = document.getElementById("filterSuppBtn");
+const filterContraBtn         = document.getElementById("filterContraBtn");
+const countAll                = document.getElementById("countAll");
+const countBad                = document.getElementById("countBad");
+const countSupp               = document.getElementById("countSupp");
+const countContra             = document.getElementById("countContra");
+
+const auditSourcesDetails     = document.getElementById("auditSourcesDetails");
+const auditSourcesSummary     = document.getElementById("auditSourcesSummary");
+const auditSourcesList        = document.getElementById("auditSourcesList");
+
+const exportAuditMdBtn        = document.getElementById("exportAuditMdBtn");
+const copyAuditSummaryBtn     = document.getElementById("copyAuditSummaryBtn");
+const headerExportAuditBtn    = document.getElementById("headerExportAuditBtn");
+const resetCheckerBtn         = document.getElementById("resetCheckerBtn");
+
+// ── State ──
+let currentAuditData = null;
+let currentClaimFilter = "all";
+let activeReferenceMode = "docs";
+
+// Pre-defined test samples for 1-click testing
+const SAMPLE_HALLUCINATED = {
+  prompt: "What were the key mission achievements and flight specs of Apollo 11?",
+  answer: "The Apollo 11 mission was launched on July 16, 1969, and successfully landed Neil Armstrong and Buzz Aldrin on the Moon. During their stay, the astronauts spent 48 continuous hours exploring the lunar surface and collected exactly 450 kilograms of core lunar rock samples. The lunar module Eagle was powered by an experimental zero-gravity cold fusion engine that boosted fuel efficiency by 85.5%, allowing the crew to travel at supersonic speeds across the lunar terrain.",
+  reference: "The Apollo 11 mission was launched from Kennedy Space Center on July 16, 1969, carrying commander Neil Armstrong, command module pilot Michael Collins, and lunar module pilot Buzz Aldrin. On July 20, Armstrong and Aldrin landed the Apollo Lunar Module Eagle on the Moon. Armstrong and Aldrin spent 2 hours 15 minutes together outside the spacecraft on the lunar surface, and collected 21.5 kilograms (47.5 pounds) of lunar material to bring back to Earth. The descent propulsion system utilized hypergolic propellants consisting of aerozine 50 fuel and nitrogen tetroxide oxidizer."
+};
+
+const SAMPLE_GROUNDED = {
+  prompt: "Summarize the Apollo 11 lunar surface activities and payload.",
+  answer: "Apollo 11 was launched on July 16, 1969, carrying astronauts Neil Armstrong, Buzz Aldrin, and Michael Collins. Neil Armstrong and Buzz Aldrin landed the Lunar Module Eagle on the Moon on July 20, 1969. The astronauts spent two hours and 15 minutes outside the spacecraft on the lunar surface and gathered 21.5 kilograms of lunar material to bring back to Earth.",
+  reference: "The Apollo 11 mission was launched from Kennedy Space Center on July 16, 1969, carrying commander Neil Armstrong, command module pilot Michael Collins, and lunar module pilot Buzz Aldrin. On July 20, Armstrong and Aldrin landed the Apollo Lunar Module Eagle on the Moon. Armstrong and Aldrin spent 2 hours 15 minutes together outside the spacecraft on the lunar surface, and collected 21.5 kilograms (47.5 pounds) of lunar material to bring back to Earth. The descent propulsion system utilized hypergolic propellants consisting of aerozine 50 fuel and nitrogen tetroxide oxidizer."
+};
+
+// Mode switcher
+function setViewMode(mode) {
+  if (mode === "checker") {
+    if (tabRagChat) {
+      tabRagChat.classList.remove("active");
+      tabRagChat.setAttribute("aria-selected", "false");
+    }
+    if (tabHallucinationChecker) {
+      tabHallucinationChecker.classList.add("active");
+      tabHallucinationChecker.setAttribute("aria-selected", "true");
+    }
+    if (chatScroll) chatScroll.style.display = "none";
+    if (composerWrap) composerWrap.style.display = "none";
+    if (hallucinationWorkspace) hallucinationWorkspace.style.display = "flex";
+    if (chatTopbarActions) chatTopbarActions.style.display = "none";
+    if (checkerTopbarActions) checkerTopbarActions.style.display = "flex";
+    updateCheckerDocStatus();
+  } else {
+    if (tabRagChat) {
+      tabRagChat.classList.add("active");
+      tabRagChat.setAttribute("aria-selected", "true");
+    }
+    if (tabHallucinationChecker) {
+      tabHallucinationChecker.classList.remove("active");
+      tabHallucinationChecker.setAttribute("aria-selected", "false");
+    }
+    if (chatScroll) chatScroll.style.display = "flex";
+    if (composerWrap) composerWrap.style.display = "block";
+    if (hallucinationWorkspace) hallucinationWorkspace.style.display = "none";
+    if (chatTopbarActions) chatTopbarActions.style.display = "flex";
+    if (checkerTopbarActions) checkerTopbarActions.style.display = "none";
+    renderChatMessages();
+  }
+}
+
+if (tabRagChat) tabRagChat.addEventListener("click", () => setViewMode("chat"));
+if (tabHallucinationChecker) tabHallucinationChecker.addEventListener("click", () => setViewMode("checker"));
+
+function switchToHallucinationChecker(answerText = "", questionText = "") {
+  setViewMode("checker");
+  if (answerText && externalAnswerInput) {
+    externalAnswerInput.value = answerText;
+    updateAnswerCounts();
+  }
+  if (questionText && externalPromptInput) {
+    externalPromptInput.value = questionText;
+  }
+  if (externalAnswerInput) {
+    externalAnswerInput.focus();
+    externalAnswerInput.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+}
+
+// Textarea Counters
+function updateAnswerCounts() {
+  if (!externalAnswerInput || !answerWordCount) return;
+  const text = externalAnswerInput.value.trim();
+  const words = text ? text.split(/\s+/).length : 0;
+  answerWordCount.textContent = `${words} words · ${text.length} chars`;
+}
+function updateReferenceCounts() {
+  if (!customReferenceInput || !referenceWordCount) return;
+  const text = customReferenceInput.value.trim();
+  const words = text ? text.split(/\s+/).length : 0;
+  referenceWordCount.textContent = `${words} words · ${text.length} chars`;
+}
+
+if (externalAnswerInput) externalAnswerInput.addEventListener("input", updateAnswerCounts);
+if (customReferenceInput) customReferenceInput.addEventListener("input", updateReferenceCounts);
+
+// Reference Mode Toggles
+function setReferenceMode(mode) {
+  activeReferenceMode = mode;
+  [refModeDocs, refModeText, refModeBoth].forEach(btn => {
+    if (btn) btn.classList.toggle("active", btn.dataset.mode === mode);
+  });
+  if (refDocsContainer) refDocsContainer.style.display = (mode === "docs" || mode === "both") ? "block" : "none";
+  if (refTextContainer) refTextContainer.style.display = (mode === "text" || mode === "both") ? "block" : "none";
+}
+
+if (refModeDocs) refModeDocs.addEventListener("click", () => setReferenceMode("docs"));
+if (refModeText) refModeText.addEventListener("click", () => setReferenceMode("text"));
+if (refModeBoth) refModeBoth.addEventListener("click", () => setReferenceMode("both"));
+
+// Doc Status in Auditor
+function updateCheckerDocStatus() {
+  if (!refDocStatusText) return;
+  const count = selectedDocIds.size;
+  if (count === 0) {
+    if (allDocs && allDocs.length > 0) {
+      refDocStatusText.innerHTML = `⚠️ No documents currently selected. <strong>${allDocs.length} indexed document(s)</strong> available in sidebar (click documents on right to select).`;
+    } else {
+      refDocStatusText.innerHTML = `ℹ️ No documents uploaded yet. Upload a file on the right, or switch to <strong>"Paste Context"</strong> tab.`;
+    }
+  } else if (count === 1) {
+    const name = [...selectedDocNames.values()][0] || "1 document";
+    refDocStatusText.innerHTML = `✓ Ready: <strong>${escHtml(name)}</strong> selected as ground truth reference.`;
+  } else {
+    refDocStatusText.innerHTML = `✓ Ready: <strong>${count} documents</strong> selected as ground truth reference.`;
+  }
+}
+
+// Sample Loader buttons
+if (sampleHallucinatedBtn) {
+  sampleHallucinatedBtn.addEventListener("click", () => {
+    externalAnswerInput.value = SAMPLE_HALLUCINATED.answer;
+    externalPromptInput.value = SAMPLE_HALLUCINATED.prompt;
+    customReferenceInput.value = SAMPLE_HALLUCINATED.reference;
+    setReferenceMode("both");
+    updateAnswerCounts();
+    updateReferenceCounts();
+    if (auditStatusMsg) {
+      auditStatusMsg.textContent = "Loaded Hallucinated sample. Click 'Calculate Hallucination Risk' to audit.";
+      setTimeout(() => { auditStatusMsg.textContent = ""; }, 4000);
+    }
+  });
+}
+
+if (sampleGroundedBtn) {
+  sampleGroundedBtn.addEventListener("click", () => {
+    externalAnswerInput.value = SAMPLE_GROUNDED.answer;
+    externalPromptInput.value = SAMPLE_GROUNDED.prompt;
+    customReferenceInput.value = SAMPLE_GROUNDED.reference;
+    setReferenceMode("both");
+    updateAnswerCounts();
+    updateReferenceCounts();
+    if (auditStatusMsg) {
+      auditStatusMsg.textContent = "Loaded Grounded sample. Click 'Calculate Hallucination Risk' to audit.";
+      setTimeout(() => { auditStatusMsg.textContent = ""; }, 4000);
+    }
+  });
+}
+
+if (clearAnswerBtn) {
+  clearAnswerBtn.addEventListener("click", () => {
+    externalAnswerInput.value = "";
+    externalPromptInput.value = "";
+    updateAnswerCounts();
+  });
+}
+
+// Run Hallucination Check
+if (runHallucinationCheckBtn) {
+  runHallucinationCheckBtn.addEventListener("click", async () => {
+    const answer = externalAnswerInput ? externalAnswerInput.value.trim() : "";
+    if (!answer) {
+      if (auditStatusMsg) auditStatusMsg.textContent = "⚠️ Please paste an answer to audit first.";
+      if (externalAnswerInput) externalAnswerInput.focus();
+      return;
+    }
+
+    const question = externalPromptInput ? externalPromptInput.value.trim() : "";
+    let reference_text = null;
+    let doc_ids = null;
+
+    if (activeReferenceMode === "text" || activeReferenceMode === "both") {
+      reference_text = customReferenceInput ? customReferenceInput.value.trim() : "";
+    }
+    if (activeReferenceMode === "docs" || activeReferenceMode === "both") {
+      doc_ids = [...selectedDocIds];
+    }
+
+    // Validation
+    if ((!reference_text || !reference_text.trim()) && (!doc_ids || doc_ids.length === 0) && (!allDocs || allDocs.length === 0)) {
+      if (auditStatusMsg) auditStatusMsg.textContent = "⚠️ Please provide reference text or select a document.";
+      return;
+    }
+
+    runHallucinationCheckBtn.disabled = true;
+    if (auditStatusMsg) auditStatusMsg.textContent = "Decomposing answer into claims and verifying evidence…";
+
+    try {
+      const response = await fetch(`${API_BASE}/verify-external`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          answer,
+          question,
+          doc_ids: doc_ids && doc_ids.length ? doc_ids : null,
+          reference_text: reference_text && reference_text.trim() ? reference_text : null,
+        }),
+      });
+
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({ detail: "Verification failed" }));
+        throw new Error(err.detail || "Verification failed");
+      }
+
+      const data = await response.json();
+      currentAuditData = data;
+      renderAuditResults(data);
+      if (auditStatusMsg) {
+        auditStatusMsg.textContent = "✓ Audit complete!";
+        setTimeout(() => { if (auditStatusMsg) auditStatusMsg.textContent = ""; }, 4000);
+      }
+    } catch (err) {
+      console.error("[AUDIT ERROR]", err);
+      if (auditStatusMsg) auditStatusMsg.textContent = `❌ ${err.message}`;
+    } finally {
+      runHallucinationCheckBtn.disabled = false;
+    }
+  });
+}
+
+// Render Audit Results
+function renderAuditResults(data) {
+  if (!auditResults) return;
+  auditResults.style.display = "block";
+
+  const metrics = data.metrics || {
+    total: (data.claims || []).length,
+    supported: 0,
+    unsupported: 0,
+    contradicted: 0,
+    abstained: 0,
+    hallucination_count: 0,
+    hallucination_percentage: data.hallucination_percentage || 0,
+    supported_percentage: 0,
+    unsupported_percentage: 0,
+    contradicted_percentage: 0,
+    risk_level: data.risk_level || "None",
+  };
+
+  const pct = Math.round(data.hallucination_percentage ?? metrics.hallucination_percentage ?? 0);
+
+  // Score Number & Circle
+  if (scoreNumber) scoreNumber.textContent = `${pct}%`;
+  if (scoreCircle) {
+    scoreCircle.className = "score-circle";
+    if (pct === 0) scoreCircle.classList.add("circle-risk-none");
+    else if (pct <= 20) scoreCircle.classList.add("circle-risk-low");
+    else if (pct <= 50) scoreCircle.classList.add("circle-risk-mod");
+    else if (pct <= 75) scoreCircle.classList.add("circle-risk-high");
+    else scoreCircle.classList.add("circle-risk-crit");
+  }
+
+  // Risk Badge
+  if (riskBadge) {
+    riskBadge.className = "risk-badge";
+    if (pct === 0) {
+      riskBadge.classList.add("badge-risk-none");
+      riskBadge.textContent = "VERIFIED GROUNDED";
+    } else if (pct <= 20) {
+      riskBadge.classList.add("badge-risk-low");
+      riskBadge.textContent = "LOW RISK";
+    } else if (pct <= 50) {
+      riskBadge.classList.add("badge-risk-mod");
+      riskBadge.textContent = "MODERATE RISK";
+    } else if (pct <= 75) {
+      riskBadge.classList.add("badge-risk-high");
+      riskBadge.textContent = "HIGH RISK";
+    } else {
+      riskBadge.classList.add("badge-risk-crit");
+      riskBadge.textContent = "CRITICAL RISK";
+    }
+  }
+
+  if (scoreTimestamp) scoreTimestamp.textContent = `Audited ${new Date().toLocaleTimeString()}`;
+  if (scoreHeadline) scoreHeadline.textContent = `Hallucination Risk: ${pct}%`;
+
+  if (scoreSummary) {
+    if (pct === 0) {
+      scoreSummary.textContent = `All ${metrics.total} factual claims evaluated are grounded in reference evidence. Zero hallucinations detected.`;
+    } else {
+      scoreSummary.textContent = `${metrics.hallucination_count} of ${metrics.total} factual claims (${pct}%) could not be verified or contradict reference evidence.`;
+    }
+  }
+
+  if (riskProgressBar) {
+    riskProgressBar.style.width = `${Math.max(pct, 2)}%`;
+    if (pct === 0) riskProgressBar.style.background = "#10b981";
+    else if (pct <= 20) riskProgressBar.style.background = "#10b981";
+    else if (pct <= 50) riskProgressBar.style.background = "#f59e0b";
+    else if (pct <= 75) riskProgressBar.style.background = "#f97316";
+    else riskProgressBar.style.background = "#ef4444";
+  }
+
+  // 4 Metric cards
+  if (metricHallucinationPct) metricHallucinationPct.textContent = `${metrics.hallucination_percentage}%`;
+  if (metricHallucinationSub) metricHallucinationSub.textContent = `${metrics.hallucination_count} ungrounded claims`;
+
+  if (metricSupportedPct) metricSupportedPct.textContent = `${metrics.supported_percentage}%`;
+  if (metricSupportedSub) metricSupportedSub.textContent = `${metrics.supported} supported claims`;
+
+  if (metricUnsupportedPct) metricUnsupportedPct.textContent = `${metrics.unsupported_percentage}%`;
+  if (metricUnsupportedSub) metricUnsupportedSub.textContent = `${metrics.unsupported} unverified claims`;
+
+  if (metricContradictedPct) metricContradictedPct.textContent = `${metrics.contradicted_percentage}%`;
+  if (metricContradictedSub) metricContradictedSub.textContent = `${metrics.contradicted} conflicting claims`;
+
+  // Render Sentence Grounding Heatmap
+  renderSentenceHeatmap(data.sentences || []);
+
+  // Filter counts
+  const badCount = (metrics.unsupported || 0) + (metrics.contradicted || 0);
+  if (countAll) countAll.textContent = metrics.total || 0;
+  if (countBad) countBad.textContent = badCount;
+  if (countSupp) countSupp.textContent = metrics.supported || 0;
+  if (countContra) countContra.textContent = metrics.contradicted || 0;
+
+  // Render Claims List
+  renderAuditClaimsList(data.claims || [], currentClaimFilter);
+
+  // Render Reference Sources
+  renderAuditSources(data.sources || []);
+
+  // Scroll smoothly down to results
+  auditResults.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+// Render Sentence Heatmap
+function renderSentenceHeatmap(sentences) {
+  if (!sentenceHeatmap) return;
+  sentenceHeatmap.innerHTML = "";
+
+  if (!sentences || sentences.length === 0) {
+    sentenceHeatmap.textContent = externalAnswerInput ? externalAnswerInput.value : "";
+    return;
+  }
+
+  sentences.forEach((sObj, idx) => {
+    const span = document.createElement("span");
+    const vClass = (sObj.verdict || "unsupported").toLowerCase();
+    span.className = `sentence-span sentence-${vClass}`;
+    span.dataset.sentenceIndex = idx;
+    span.textContent = sObj.text + " ";
+    span.title = `[${(sObj.verdict || "?").toUpperCase()}] ${sObj.reason || ""}`;
+
+    // Click to highlight corresponding claim card
+    span.addEventListener("click", () => {
+      document.querySelectorAll(".sentence-span.active-inspect").forEach(el => el.classList.remove("active-inspect"));
+      span.classList.add("active-inspect");
+
+      const targetCard = auditClaimsList.querySelector(`.audit-claim-card[data-sentence-index="${idx}"]`);
+      if (targetCard) {
+        targetCard.scrollIntoView({ behavior: "smooth", block: "center" });
+        targetCard.style.outline = "2px solid var(--accent)";
+        setTimeout(() => { targetCard.style.outline = "none"; }, 2000);
+      }
+    });
+
+    sentenceHeatmap.appendChild(span);
+  });
+}
+
+// Render Claims List
+function renderAuditClaimsList(claims, filter = "all") {
+  if (!auditClaimsList) return;
+  auditClaimsList.innerHTML = "";
+
+  const filtered = claims.filter(c => {
+    const v = (c.verdict || "").toLowerCase();
+    if (filter === "all") return true;
+    if (filter === "unsupported") return v === "unsupported" || v === "contradicted";
+    if (filter === "supported") return v === "supported";
+    if (filter === "contradicted") return v === "contradicted";
+    return true;
+  });
+
+  if (filtered.length === 0) {
+    const emptyP = document.createElement("p");
+    emptyP.className = "field-subtext";
+    emptyP.style.padding = "10px";
+    emptyP.textContent = "No claims match this filter.";
+    auditClaimsList.appendChild(emptyP);
+    return;
+  }
+
+  filtered.forEach((claim, idx) => {
+    const card = document.createElement("div");
+    const vClass = (claim.verdict || "unsupported").toLowerCase();
+    card.className = `audit-claim-card verdict-${vClass}`;
+    if (claim.sentence) {
+      card.dataset.sentence = claim.sentence;
+    }
+
+    const head = document.createElement("div");
+    head.className = "claim-card-head";
+
+    const vPill = document.createElement("span");
+    vPill.className = `claim-card-verdict verdict-pill-${vClass}`;
+    vPill.textContent = (claim.verdict || "UNSUPPORTED").toUpperCase();
+
+    const claimTitle = document.createElement("span");
+    claimTitle.className = "claim-card-claim";
+    claimTitle.textContent = claim.claim || "";
+
+    head.appendChild(vPill);
+    head.appendChild(claimTitle);
+    card.appendChild(head);
+
+    if (claim.reason) {
+      const reasonDiv = document.createElement("div");
+      reasonDiv.className = "claim-card-reason";
+      reasonDiv.innerHTML = `<strong>Reason:</strong> ${escHtml(claim.reason)}`;
+      card.appendChild(reasonDiv);
+    }
+
+    if (claim.quote) {
+      const quoteBox = document.createElement("div");
+      quoteBox.className = "claim-quote-box";
+      quoteBox.textContent = `“${claim.quote}”`;
+      card.appendChild(quoteBox);
+    }
+
+    if (claim.source_ids && claim.source_ids.length > 0) {
+      const tagRow = document.createElement("div");
+      tagRow.className = "claim-source-tags";
+      claim.source_ids.forEach(sid => {
+        const tag = document.createElement("span");
+        tag.className = "claim-source-tag";
+        tag.textContent = sid;
+        tagRow.appendChild(tag);
+      });
+      card.appendChild(tagRow);
+    }
+
+    auditClaimsList.appendChild(card);
+  });
+}
+
+// Filter button events
+function setClaimFilter(f) {
+  currentClaimFilter = f;
+  [filterAllBtn, filterBadBtn, filterSuppBtn, filterContraBtn].forEach(btn => {
+    if (btn) btn.classList.toggle("active", btn.dataset.filter === f);
+  });
+  if (currentAuditData) {
+    renderAuditClaimsList(currentAuditData.claims || [], f);
+  }
+}
+
+if (filterAllBtn) filterAllBtn.addEventListener("click", () => setClaimFilter("all"));
+if (filterBadBtn) filterBadBtn.addEventListener("click", () => setClaimFilter("unsupported"));
+if (filterSuppBtn) filterSuppBtn.addEventListener("click", () => setClaimFilter("supported"));
+if (filterContraBtn) filterContraBtn.addEventListener("click", () => setClaimFilter("contradicted"));
+
+// Render Reference Sources
+function renderAuditSources(sources) {
+  if (!auditSourcesList || !auditSourcesSummary) return;
+  auditSourcesList.innerHTML = "";
+  auditSourcesSummary.textContent = `Reference Evidence Sources Evaluated (${(sources || []).length})`;
+
+  if (!sources || sources.length === 0) {
+    const p = document.createElement("p");
+    p.className = "field-subtext";
+    p.textContent = "No specific reference passages recorded.";
+    auditSourcesList.appendChild(p);
+    return;
+  }
+
+  sources.forEach((s, idx) => {
+    const item = document.createElement("div");
+    item.className = "audit-source-item";
+    const sid = `source_${idx + 1}`;
+    const fname = s.metadata?.filename || s.metadata?.doc_id || "Reference Context";
+    const page = s.metadata?.page_start ? ` (page ${s.metadata.page_start})` : "";
+    item.innerHTML = `<strong>[${sid}] ${escHtml(fname)}${page}</strong>${escHtml(s.text || "")}`;
+    auditSourcesList.appendChild(item);
+  });
+}
+
+// Reset Checker Form
+function resetCheckerForm() {
+  if (externalAnswerInput) externalAnswerInput.value = "";
+  if (externalPromptInput) externalPromptInput.value = "";
+  if (customReferenceInput) customReferenceInput.value = "";
+  updateAnswerCounts();
+  updateReferenceCounts();
+  if (auditResults) auditResults.style.display = "none";
+  currentAuditData = null;
+  if (auditStatusMsg) auditStatusMsg.textContent = "Checker form reset.";
+  setTimeout(() => { if (auditStatusMsg) auditStatusMsg.textContent = ""; }, 2500);
+}
+
+if (resetCheckerBtn) resetCheckerBtn.addEventListener("click", resetCheckerForm);
+
+// Export & Copy Audit Reports
+function generateAuditMarkdown() {
+  if (!currentAuditData) return "";
+  const d = currentAuditData;
+  const m = d.metrics || {};
+  const lines = [
+    `# VerifiableRAG — LLM Hallucination & Grounding Audit Report`,
+    `_Generated on: ${new Date().toLocaleString()}_`,
+    "",
+    `## Executive Summary`,
+    `- **Hallucination Risk Score:** ${d.hallucination_percentage ?? m.hallucination_percentage}% (${d.risk_level || m.risk_level || "Unknown"} Risk)`,
+    `- **Total Factual Claims:** ${m.total || 0}`,
+    `- **Supported / Grounded Claims:** ${m.supported || 0} (${m.supported_percentage || 0}%)`,
+    `- **Unsupported / Hallucinated Claims:** ${m.unsupported || 0} (${m.unsupported_percentage || 0}%)`,
+    `- **Directly Contradicted Claims:** ${m.contradicted || 0} (${m.contradicted_percentage || 0}%)`,
+    "",
+    `## LLM Answer Evaluated`,
+    d.answer || "",
+    "",
+    `## Claim Verification Breakdown`,
+  ];
+
+  (d.claims || []).forEach((c, idx) => {
+    lines.push(`### Claim ${idx + 1} [${(c.verdict || "UNSUPPORTED").toUpperCase()}]`);
+    lines.push(`- **Claim:** ${c.claim}`);
+    if (c.reason) lines.push(`- **Reasoning:** ${c.reason}`);
+    if (c.quote) lines.push(`- **Reference Quote:** _"${c.quote}"_`);
+    if (c.source_ids && c.source_ids.length) lines.push(`- **Sources:** ${c.source_ids.join(", ")}`);
+    lines.push("");
+  });
+
+  if (d.sources && d.sources.length) {
+    lines.push(`## Reference Sources Used`);
+    d.sources.forEach((s, i) => {
+      const fn = s.metadata?.filename || "Reference Text";
+      lines.push(`${i + 1}. **[source_${i + 1}] ${fn}:** ${s.text}`);
+    });
+  }
+
+  return lines.join("\n");
+}
+
+function exportAuditReport() {
+  const md = generateAuditMarkdown();
+  if (!md) { alert("Please run an audit first."); return; }
+  const blob = new Blob([md], { type: "text/markdown" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `hallucination_audit_${Date.now()}.md`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+if (exportAuditMdBtn) exportAuditMdBtn.addEventListener("click", exportAuditReport);
+if (headerExportAuditBtn) headerExportAuditBtn.addEventListener("click", exportAuditReport);
+
+if (copyAuditSummaryBtn) {
+  copyAuditSummaryBtn.addEventListener("click", () => {
+    if (!currentAuditData) { alert("Please run an audit first."); return; }
+    const m = currentAuditData.metrics || {};
+    const text = `VerifiableRAG Hallucination Audit:\nHallucination Risk: ${currentAuditData.hallucination_percentage}%\nSupported Claims: ${m.supported}/${m.total} (${m.supported_percentage}%)\nHallucinated Claims: ${m.hallucination_count}/${m.total} (${m.hallucination_percentage}%)`;
+    navigator.clipboard.writeText(text).then(() => {
+      copyAuditSummaryBtn.textContent = "✓ Copied Summary!";
+      setTimeout(() => { copyAuditSummaryBtn.textContent = "Copy Audit Summary"; }, 2000);
+    });
+  });
+}
+

@@ -599,9 +599,11 @@ def extract_and_verify_claims(
     answer: str,
     evidence_chunks: list[dict],
     question: str = "",
+    strip_numeric: bool = True,
 ) -> list[dict]:
     """Split answer into claims and verify each against evidence in one LLM call."""
-    answer = _strip_unverified_numeric_sentences(answer, evidence_chunks)
+    if strip_numeric:
+        answer = _strip_unverified_numeric_sentences(answer, evidence_chunks)
     context = _format_evidence(evidence_chunks)
     procedural_instruction = (
         "For procedural questions, mark every step UNSUPPORTED unless the Context "
@@ -710,33 +712,351 @@ def _contains_unverified_percentage(answer: str, evidence_chunks: list[dict]) ->
     return False
 
 
-def compute_hallucination_risk_score(verdicts: list[dict], abstained: bool) -> int:
+def compute_hallucination_metrics(verdicts: list[dict], abstained: bool = False) -> dict:
     """
-    Return an integer 0–100 representing hallucination risk.
+    Compute detailed hallucination percentages and grounding metrics.
 
-    This is derived from the claim counters only; no independent free-form scoring.
-    Any asserted unsupported or contradicted claim is treated as high risk.
-    A pure correct abstention remains 0 risk.
+    Returns a dictionary:
+    - total: total number of claims evaluated
+    - supported: count of SUPPORTED claims
+    - unsupported: count of UNSUPPORTED claims
+    - contradicted: count of CONTRADICTED claims
+    - abstained: count of ABSTAINED claims
+    - hallucination_count: unsupported + contradicted
+    - hallucination_percentage: float (0.0 to 100.0)
+    - supported_percentage: float (0.0 to 100.0)
+    - unsupported_percentage: float (0.0 to 100.0)
+    - contradicted_percentage: float (0.0 to 100.0)
+    - abstained_percentage: float (0.0 to 100.0)
+    - hallucination_risk_score: int (0 to 100)
+    - risk_level: "None" | "Low" | "Moderate" | "High" | "Critical"
     """
-    if abstained:
-        return 0
     if not verdicts:
-        return 0
-    if any(
-        v.get("verdict", "").upper() in ("UNSUPPORTED", "CONTRADICTED")
-        for v in verdicts
-    ):
-        return 100
-    total = sum(
-        1 for v in verdicts if v.get("verdict", "").upper() in ("SUPPORTED", "UNSUPPORTED", "CONTRADICTED", "ABSTAINED")
-    )
+        return {
+            "total": 0,
+            "supported": 0,
+            "unsupported": 0,
+            "contradicted": 0,
+            "abstained": 0,
+            "hallucination_count": 0,
+            "hallucination_percentage": 0.0,
+            "supported_percentage": 0.0,
+            "unsupported_percentage": 0.0,
+            "contradicted_percentage": 0.0,
+            "abstained_percentage": 0.0,
+            "hallucination_risk_score": 0,
+            "risk_level": "None",
+        }
+
+    counts = {
+        "SUPPORTED": 0,
+        "UNSUPPORTED": 0,
+        "CONTRADICTED": 0,
+        "ABSTAINED": 0,
+    }
+    for v in verdicts:
+        verdict_str = v.get("verdict", "").upper()
+        if verdict_str in counts:
+            counts[verdict_str] += 1
+        else:
+            counts["UNSUPPORTED"] += 1
+
+    total = sum(counts.values())
+    bad_count = counts["UNSUPPORTED"] + counts["CONTRADICTED"]
+
     if total == 0:
-        return 0
-    non_supported = sum(
-        1 for v in verdicts
-        if v.get("verdict", "").upper() in ("UNSUPPORTED", "CONTRADICTED")
-    )
-    return round(100 * non_supported / total)
+        pct = 0.0
+    elif abstained and bad_count == 0:
+        pct = 0.0
+    else:
+        pct = round((bad_count / total) * 100.0, 1)
+
+    supp_pct = round((counts["SUPPORTED"] / total) * 100.0, 1) if total > 0 else 0.0
+    unsupp_pct = round((counts["UNSUPPORTED"] / total) * 100.0, 1) if total > 0 else 0.0
+    contra_pct = round((counts["CONTRADICTED"] / total) * 100.0, 1) if total > 0 else 0.0
+    abst_pct = round((counts["ABSTAINED"] / total) * 100.0, 1) if total > 0 else 0.0
+
+    if pct == 0.0:
+        risk_level = "None" if (counts["SUPPORTED"] > 0 or counts["ABSTAINED"] > 0) else "Low"
+    elif pct <= 20.0:
+        risk_level = "Low"
+    elif pct <= 50.0:
+        risk_level = "Moderate"
+    elif pct <= 75.0:
+        risk_level = "High"
+    else:
+        risk_level = "Critical"
+
+    return {
+        "total": total,
+        "supported": counts["SUPPORTED"],
+        "unsupported": counts["UNSUPPORTED"],
+        "contradicted": counts["CONTRADICTED"],
+        "abstained": counts["ABSTAINED"],
+        "hallucination_count": bad_count,
+        "hallucination_percentage": pct,
+        "supported_percentage": supp_pct,
+        "unsupported_percentage": unsupp_pct,
+        "contradicted_percentage": contra_pct,
+        "abstained_percentage": abst_pct,
+        "hallucination_risk_score": int(round(pct)),
+        "risk_level": risk_level,
+    }
+
+
+def compute_hallucination_risk_score(verdicts: list[dict], abstained: bool = False) -> int:
+    """Return an integer 0–100 representing hallucination risk."""
+    metrics = compute_hallucination_metrics(verdicts, abstained=abstained)
+    return metrics["hallucination_risk_score"]
+
+
+def _lexical_fallback_verification(answer: str, evidence_chunks: list[dict]) -> list[dict]:
+    """Deterministic fallback claim verification when LLM client is unavailable or times out."""
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", answer.strip()) if s.strip()]
+    if not sentences:
+        sentences = [answer.strip()] if answer.strip() else []
+
+    evidence_text = " ".join(c.get("text", "") for c in evidence_chunks)
+    verdicts = []
+    for s in sentences:
+        if _claim_matches_abstention_regex(s) or _is_correct_abstention(s):
+            verdicts.append({
+                "claim": s,
+                "sentence": s,
+                "verdict": "ABSTAINED",
+                "reason": "Statement is an abstention or notes absent information.",
+                "source_ids": [],
+                "quote": "",
+            })
+            continue
+
+        if _looks_like_derived_numeric_claim(s, evidence_chunks) or _has_numeric_claim_without_support(s, evidence_chunks):
+            verdicts.append({
+                "claim": s,
+                "sentence": s,
+                "verdict": "UNSUPPORTED",
+                "reason": "Contains numeric or statistical assertions not found in the reference evidence.",
+                "source_ids": [],
+                "quote": "",
+            })
+            continue
+
+        best_sid = None
+        best_overlap = 0.0
+        best_chunk_text = ""
+        for i, c in enumerate(evidence_chunks):
+            chunk_t = c.get("text", "")
+            overlap = _quote_overlap_ratio(s, chunk_t)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_sid = f"source_{i+1}"
+                best_chunk_text = chunk_t
+
+        if best_overlap >= 0.70:
+            verdicts.append({
+                "claim": s,
+                "sentence": s,
+                "verdict": "SUPPORTED",
+                "reason": f"Grounded in reference context ({int(best_overlap*100)}% term match).",
+                "source_ids": [best_sid] if best_sid else [],
+                "quote": best_chunk_text[:200] + ("..." if len(best_chunk_text) > 200 else ""),
+            })
+        else:
+            verdicts.append({
+                "claim": s,
+                "sentence": s,
+                "verdict": "UNSUPPORTED",
+                "reason": "Not sufficiently grounded in reference evidence (low lexical overlap).",
+                "source_ids": [],
+                "quote": "",
+            })
+
+    return verdicts
+
+
+def verify_external_llm_answer(
+    answer: str,
+    evidence_chunks: list[dict],
+    question: str = "",
+) -> dict:
+    """
+    Deconstruct an external LLM-generated answer into atomic factual claims,
+    evaluate each claim against retrieved or provided reference evidence,
+    map results to individual sentences in the answer, and calculate
+    comprehensive hallucination risk percentages.
+    """
+    if not answer or not answer.strip():
+        empty_metrics = compute_hallucination_metrics([], abstained=True)
+        return {
+            "answer": "",
+            "question": question,
+            "claims": [],
+            "sentences": [],
+            "metrics": empty_metrics,
+            "hallucination_percentage": 0.0,
+            "hallucination_risk_score": 0,
+            "risk_level": "None",
+            "sources": evidence_chunks or [],
+            "total_sources": len(evidence_chunks or []),
+        }
+
+    raw_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", answer.strip()) if s.strip()]
+    if not raw_sentences:
+        raw_sentences = [answer.strip()]
+
+    if not evidence_chunks:
+        claims = [
+            {
+                "claim": s,
+                "sentence": s,
+                "verdict": "UNSUPPORTED",
+                "reason": "No reference evidence was provided to verify this claim against.",
+                "source_ids": [],
+                "quote": "",
+            }
+            for s in raw_sentences
+        ]
+        metrics = compute_hallucination_metrics(claims, abstained=False)
+        sentences_res = [
+            {
+                "sentence_index": idx,
+                "text": s,
+                "verdict": "UNSUPPORTED",
+                "reason": "No reference evidence available to verify this statement.",
+                "source_ids": [],
+                "quote": "",
+                "claims": [claims[idx]],
+            }
+            for idx, s in enumerate(raw_sentences)
+        ]
+        return {
+            "answer": answer,
+            "question": question,
+            "claims": claims,
+            "sentences": sentences_res,
+            "metrics": metrics,
+            "hallucination_percentage": metrics["hallucination_percentage"],
+            "hallucination_risk_score": metrics["hallucination_risk_score"],
+            "risk_level": metrics["risk_level"],
+            "sources": [],
+            "total_sources": 0,
+        }
+
+    context = _format_evidence(evidence_chunks)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an expert Hallucination Auditor and Fact Verification Engine.\n"
+                "You are auditing an answer generated by an external LLM against the provided Context passages.\n\n"
+                "Your objective:\n"
+                "1. Break down the Answer into individual atomic factual claims (each claim should express exactly one distinct fact).\n"
+                "2. For each claim, determine the exact verdict against the Context:\n"
+                "   - SUPPORTED: The claim is directly stated, verified, or accurately supported by the Context.\n"
+                "   - UNSUPPORTED: The claim asserts a fact, statistic, percentage, date, name, or conclusion NOT present in or verified by the Context (Hallucination).\n"
+                "   - CONTRADICTED: The claim directly contradicts or conflicts with what the Context states (Direct Hallucination/Error).\n"
+                "   - ABSTAINED: The claim merely states that information is not available or makes a neutral non-factual remark.\n"
+                "3. Be strict with numbers, dates, and percentages: if a figure is not explicitly verified by the Context, mark it UNSUPPORTED.\n"
+                "4. Identify the matching original sentence from the answer, the reason for your verdict, verbatim quote from Context if grounded, and cited source IDs (e.g. ['source_1']).\n\n"
+                "Respond ONLY with valid JSON in this format:\n"
+                '{"verdicts": [\n'
+                '  {"claim": "...", "sentence": "...", "verdict": "SUPPORTED"|"UNSUPPORTED"|"CONTRADICTED"|"ABSTAINED", "reason": "...", "quote": "...", "source_ids": ["source_1"]}\n'
+                ']}'
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Context:\n{context}\n\nQuestion/Prompt:\n{question or 'General factual inquiry'}\n\nLLM Answer to Verify:\n{answer}",
+        },
+    ]
+
+    verdicts: list[dict] = []
+    try:
+        raw = chat(messages, temperature=0.0, json_mode=True, max_tokens=int(os.getenv("LLM_VERIFY_MAX_TOKENS", "1200")))
+        parsed = safe_json_parse(raw, fallback={"verdicts": []})
+        verdicts = parsed.get("verdicts", [])
+    except Exception as exc:
+        print(f"[VERIFY-EXTERNAL] LLM verification failed ({exc}), falling back to lexical verification")
+        verdicts = _lexical_fallback_verification(answer, evidence_chunks)
+
+    if not verdicts:
+        verdicts = _lexical_fallback_verification(answer, evidence_chunks)
+
+    for v in verdicts:
+        v.setdefault("reason", "")
+        v.setdefault("quote", "")
+        v.setdefault("source_ids", [])
+        v.setdefault("sentence", "")
+
+    verdicts = _postprocess_verdicts(verdicts, evidence_chunks)
+    verdicts = _detect_cross_doc_contradictions(verdicts, evidence_chunks)
+
+    # Map claims to sentences
+    sentence_analyses = []
+    for idx, sentence in enumerate(raw_sentences):
+        matching_claims = []
+        for v in verdicts:
+            v_sent = v.get("sentence", "").strip()
+            v_claim = v.get("claim", "").strip()
+            if v_sent and (v_sent in sentence or sentence in v_sent or _quote_overlap_ratio(v_sent, sentence) >= 0.5):
+                matching_claims.append(v)
+            elif _quote_overlap_ratio(v_claim, sentence) >= 0.4:
+                matching_claims.append(v)
+
+        if not matching_claims:
+            if len(raw_sentences) == len(verdicts):
+                matching_claims = [verdicts[idx]]
+            elif len(raw_sentences) == 1 and verdicts:
+                matching_claims = verdicts
+
+        if any(c.get("verdict", "").upper() == "CONTRADICTED" for c in matching_claims):
+            s_verdict = "CONTRADICTED"
+            s_reason = next((c.get("reason") for c in matching_claims if c.get("verdict", "").upper() == "CONTRADICTED"), "Contradicts reference context.")
+        elif any(c.get("verdict", "").upper() == "UNSUPPORTED" for c in matching_claims):
+            s_verdict = "UNSUPPORTED"
+            s_reason = next((c.get("reason") for c in matching_claims if c.get("verdict", "").upper() == "UNSUPPORTED"), "Claim is unverified by reference context.")
+        elif any(c.get("verdict", "").upper() == "SUPPORTED" for c in matching_claims):
+            s_verdict = "SUPPORTED"
+            s_reason = next((c.get("reason") for c in matching_claims if c.get("verdict", "").upper() == "SUPPORTED"), "Supported by reference evidence.")
+        elif any(c.get("verdict", "").upper() == "ABSTAINED" for c in matching_claims):
+            s_verdict = "ABSTAINED"
+            s_reason = "Statement notes missing evidence or is neutral."
+        else:
+            max_ov = max((_quote_overlap_ratio(sentence, c.get("text", "")) for c in evidence_chunks), default=0.0)
+            if max_ov >= 0.65:
+                s_verdict = "SUPPORTED"
+                s_reason = "Substantial lexical overlap with reference evidence."
+            else:
+                s_verdict = "UNSUPPORTED"
+                s_reason = "No matching grounded claim found in reference evidence."
+
+        all_source_ids = list(dict.fromkeys(sid for c in matching_claims for sid in c.get("source_ids", [])))
+        all_quotes = " | ".join(c.get("quote", "") for c in matching_claims if c.get("quote"))
+
+        sentence_analyses.append({
+            "sentence_index": idx,
+            "text": sentence,
+            "verdict": s_verdict,
+            "reason": s_reason,
+            "source_ids": all_source_ids,
+            "quote": all_quotes,
+            "claims": matching_claims,
+        })
+
+    metrics = compute_hallucination_metrics(verdicts, abstained=False)
+
+    return {
+        "answer": answer,
+        "question": question,
+        "claims": verdicts,
+        "sentences": sentence_analyses,
+        "metrics": metrics,
+        "hallucination_percentage": metrics["hallucination_percentage"],
+        "hallucination_risk_score": metrics["hallucination_risk_score"],
+        "risk_level": metrics["risk_level"],
+        "sources": evidence_chunks,
+        "total_sources": len(evidence_chunks),
+    }
 
 
 def answer_with_verification(question: str, doc_id: str | None, top_k: int = 3) -> dict:
@@ -745,16 +1065,14 @@ def answer_with_verification(question: str, doc_id: str | None, top_k: int = 3) 
       1. Retrieve evidence.
       2. Generate answer.
       3. Verify claims.
-      4. If ANY claim is UNSUPPORTED or CONTRADICTED → discard answer, return abstention.
+      4. If ANY claim is UNSUPPORTED or CONTRADICTED -> discard answer, return abstention.
       5. Otherwise return the answer intact.
-
-    No sentence-level surgery. The answer is either shown whole or not at all.
-    This guarantees zero dangling fragments and zero hallucinated numbers.
     """
     effective_top_k = top_k * _SUMMARY_TOP_K_MULTIPLIER if _is_summary_question(question) else top_k
 
     evidence = retrieve(question, top_k=effective_top_k, doc_id=doc_id)
     if not evidence:
+        empty_metrics = compute_hallucination_metrics([], abstained=True)
         return {
             "answer": ABSTENTION_MESSAGE,
             "abstained": True,
@@ -768,12 +1086,18 @@ def answer_with_verification(question: str, doc_id: str | None, top_k: int = 3) 
             "sources": [],
             "rounds": 0,
             "hallucination_risk_score": 0,
+            "hallucination_percentage": 0.0,
+            "metrics": empty_metrics,
         }
 
-    # Pre-generation gate: if the question itself asks for a numeric value
-    # that isn't in the evidence, abstain immediately without generating.
+    # Pre-generation gate: if numeric value asked for isn't in evidence, abstain
     if (_is_exact_value_request(question) or _is_numeric_relationship_request(question)) \
             and not _evidence_has_explicit_exact_numeric_value(question, evidence):
+        abst_metrics = compute_hallucination_metrics([{
+            "claim": question,
+            "verdict": "ABSTAINED",
+            "reason": "The document does not explicitly state the requested numerical value.",
+        }], abstained=True)
         return {
             "answer": ABSTENTION_FALLBACK_MESSAGE,
             "abstained": True,
@@ -787,6 +1111,8 @@ def answer_with_verification(question: str, doc_id: str | None, top_k: int = 3) 
             "sources": evidence,
             "rounds": 0,
             "hallucination_risk_score": 0,
+            "hallucination_percentage": 0.0,
+            "metrics": abst_metrics,
         }
 
     # ── Generate ──────────────────────────────────────────────────────────────
@@ -808,18 +1134,18 @@ def answer_with_verification(question: str, doc_id: str | None, top_k: int = 3) 
             "sources": evidence,
             "rounds": 0,
             "hallucination_risk_score": 0,
+            "hallucination_percentage": 0.0,
+            "metrics": compute_hallucination_metrics([], abstained=True),
         }
 
-    # ── Verify (all-or-nothing safety gate) ────────────────────────────────────
-    # Never display a generated answer unless every factual claim is grounded.
-    # This is particularly important for procedural questions, where an LLM can
-    # otherwise turn a missing procedure into plausible-looking instructions.
+    # ── Verify ────────────────────────────────────────────────────────────────
     verdicts = extract_and_verify_claims(answer, evidence, question=question)
     has_bad_claim = any(
         v.get("verdict", "").upper() in ("UNSUPPORTED", "CONTRADICTED")
         for v in verdicts
     )
     if has_bad_claim or not verdicts:
+        bad_metrics = compute_hallucination_metrics(verdicts or [], abstained=False)
         return {
             "answer": ABSTENTION_FALLBACK_MESSAGE,
             "abstained": True,
@@ -832,14 +1158,15 @@ def answer_with_verification(question: str, doc_id: str | None, top_k: int = 3) 
             }],
             "sources": evidence,
             "rounds": 0,
-            "hallucination_risk_score": 0,
+            "hallucination_risk_score": bad_metrics["hallucination_risk_score"],
+            "hallucination_percentage": bad_metrics["hallucination_percentage"],
+            "metrics": bad_metrics,
         }
 
-    # If the answer is a refusal, preserve the refusal rather than treating it
-    # as a factual answer.
     is_abstained = all(
         v.get("verdict", "").upper() == "ABSTAINED" for v in verdicts
     )
+    metrics = compute_hallucination_metrics(verdicts, is_abstained)
 
     result = {
         "answer": answer,
@@ -847,13 +1174,15 @@ def answer_with_verification(question: str, doc_id: str | None, top_k: int = 3) 
         "claims": verdicts,
         "sources": evidence,
         "rounds": 0,
-        "hallucination_risk_score": compute_hallucination_risk_score(verdicts, is_abstained),
+        "hallucination_risk_score": metrics["hallucination_risk_score"],
+        "hallucination_percentage": metrics["hallucination_percentage"],
+        "metrics": metrics,
     }
 
-    # Hard fallback: physically impossible to return an empty answer box.
     if not result.get("answer") or not result["answer"].strip():
         result["answer"] = "I'm not able to find verified information in the document to answer this question."
         result["abstained"] = True
         result["hallucination_risk_score"] = 0
+        result["hallucination_percentage"] = 0.0
 
     return result

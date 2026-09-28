@@ -17,6 +17,8 @@ Run with:  uvicorn app:app --reload --port 8000
 """
 
 import os
+import re
+import json
 import shutil
 import uuid
 from contextlib import asynccontextmanager
@@ -43,6 +45,8 @@ from modules.claim_verifier import (
     _format_evidence,
     extract_and_verify_claims,
     compute_hallucination_risk_score,
+    compute_hallucination_metrics,
+    verify_external_llm_answer,
     _contains_unverified_percentage,
     ABSTENTION_MESSAGE,
     ABSTENTION_FALLBACK_MESSAGE,
@@ -100,6 +104,14 @@ class SearchRequest(BaseModel):
 class SummarizeRequest(BaseModel):
     doc_id: str
     style: str = "concise"   # "concise" | "detailed" | "bullets"
+
+
+class VerifyExternalRequest(BaseModel):
+    answer: str
+    question: str | None = None
+    doc_id: str | None = None
+    doc_ids: list[str] | None = None
+    reference_text: str | None = None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -274,28 +286,33 @@ def ask_question(req: AskRequest):
                         for v in verdicts
                     )
                     if has_bad:
+                        bad_metrics = compute_hallucination_metrics(verdicts, abstained=False)
                         result = {
                             "answer": ABSTENTION_FALLBACK_MESSAGE,
                             "abstained": True,
                             "claims": verdicts,
                             "sources": evidence,
                             "rounds": 0,
-                            "hallucination_risk_score": 0,
+                            "hallucination_risk_score": bad_metrics["hallucination_risk_score"],
+                            "hallucination_percentage": bad_metrics["hallucination_percentage"],
+                            "metrics": bad_metrics,
                         }
                     else:
-                        # Only treat as abstained when there are no supported claims
-                        # and no unsupported/contradicted ones.
                         is_abstained = not bool(supported)
+                        metrics = compute_hallucination_metrics(verdicts, is_abstained)
                         result = {
                             "answer": answer,
                             "abstained": is_abstained,
                             "claims": verdicts,
                             "sources": evidence,
                             "rounds": 0,
-                            "hallucination_risk_score": compute_hallucination_risk_score(verdicts, is_abstained),
+                            "hallucination_risk_score": metrics["hallucination_risk_score"],
+                            "hallucination_percentage": metrics["hallucination_percentage"],
+                            "metrics": metrics,
                         }
     except Exception as e:
         print(f"[ASK] pipeline error: {type(e).__name__}: {e}")
+        empty_metrics = compute_hallucination_metrics([], abstained=True)
         result = {
             "answer": "I'm not able to find verified information in the document to answer this question.",
             "abstained": True,
@@ -303,6 +320,8 @@ def ask_question(req: AskRequest):
             "sources": [],
             "rounds": 0,
             "hallucination_risk_score": 0,
+            "hallucination_percentage": 0.0,
+            "metrics": empty_metrics,
         }
 
     # Hard safety net: never return an empty answer box under any circumstance.
@@ -310,15 +329,81 @@ def ask_question(req: AskRequest):
         result["answer"] = "I'm not able to find verified information in the document to answer this question."
         result["abstained"] = True
         result["hallucination_risk_score"] = 0
-    # DETERMINISTIC PERCENTAGE CHECK — temporarily disabled, was over-triggering.
-    # elif not result.get("abstained", False):
-    #     sources = result.get("sources", [])
-    #     if sources and _contains_unverified_percentage(str(result["answer"]), sources):
-    #         result["answer"] = ABSTENTION_FALLBACK_MESSAGE
-    #         result["abstained"] = True
-    #         result["hallucination_risk_score"] = 0
+        result["hallucination_percentage"] = 0.0
+
+    if "hallucination_percentage" not in result:
+        result["hallucination_percentage"] = float(result.get("hallucination_risk_score", 0))
+    if "metrics" not in result:
+        result["metrics"] = compute_hallucination_metrics(
+            result.get("claims", []),
+            result.get("abstained", False)
+        )
 
     return result
+
+
+@app.post("/verify-external")
+@app.post("/check-hallucination")
+def verify_external_answer_endpoint(req: VerifyExternalRequest):
+    """
+    Audit an external LLM-generated answer for hallucinations against
+    indexed documents and/or user-provided reference text.
+    Returns atomic claim verdicts, sentence grounding heatmap, and
+    detailed hallucination percentage scores.
+    """
+    if not req.answer or not req.answer.strip():
+        raise HTTPException(status_code=400, detail="Answer text cannot be empty.")
+
+    evidence_chunks: list[dict] = []
+
+    # 1. Process custom reference text if supplied
+    if req.reference_text and req.reference_text.strip():
+        ref_text = req.reference_text.strip()
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", ref_text) if p.strip()]
+        if not paragraphs:
+            paragraphs = [ref_text]
+        for idx, p in enumerate(paragraphs):
+            evidence_chunks.append({
+                "id": f"ref_{idx + 1}",
+                "text": p,
+                "metadata": {
+                    "filename": "Pasted Reference Context",
+                    "doc_id": "pasted_ref",
+                    "chunk_index": idx + 1,
+                    "page_start": 1,
+                },
+                "boost_score": 0,
+                "distance": 0.0,
+                "lexical_score": 0,
+            })
+
+    # 2. Retrieve from indexed documents if requested or if no reference text was given
+    doc_ids = req.doc_ids or ([] if not req.doc_id else [req.doc_id])
+    if doc_ids or (not req.reference_text and list_documents()):
+        query = (req.question or "") + " " + req.answer[:400]
+        try:
+            retrieved = _retrieve_multi(query.strip(), doc_ids or None, top_k=6)
+            evidence_chunks.extend(retrieved)
+        except Exception as e:
+            print(f"[VERIFY-EXTERNAL] retrieval note: {e}")
+
+    if not evidence_chunks:
+        raise HTTPException(
+            status_code=400,
+            detail="No reference evidence available. Please select an indexed document or paste reference context.",
+        )
+
+    try:
+        result = verify_external_llm_answer(
+            answer=req.answer.strip(),
+            evidence_chunks=evidence_chunks,
+            question=(req.question or "").strip(),
+        )
+        return result
+    except Exception as e:
+        print(f"[VERIFY-EXTERNAL] error: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Verification failed: {e}")
+
 
 
 @app.post("/search")
@@ -542,6 +627,7 @@ def ask_stream(req: AskRequest):
 
             # ── 3. Verify claims — all-or-nothing: any bad claim → abstain ───
             if ABSTENTION_MESSAGE in full_answer:
+                abst_metrics = compute_hallucination_metrics([], abstained=True)
                 yield event({
                     "type": "verify",
                     "claims": [],
@@ -549,6 +635,8 @@ def ask_stream(req: AskRequest):
                     "abstained": True,
                     "rounds": 0,
                     "hallucination_risk_score": 0,
+                    "hallucination_percentage": 0.0,
+                    "metrics": abst_metrics,
                 })
             else:
                 verdicts = extract_and_verify_claims(full_answer, evidence, question=req.question)
@@ -558,7 +646,7 @@ def ask_stream(req: AskRequest):
                 )
                 if has_bad:
                     # Discard answer — show abstention instead of hallucinated content.
-                    # Patch the already-streamed text box via a replace token.
+                    bad_metrics = compute_hallucination_metrics(verdicts, abstained=False)
                     yield event({"type": "token", "text": "", "replace": ABSTENTION_FALLBACK_MESSAGE})
                     yield event({
                         "type": "verify",
@@ -572,17 +660,22 @@ def ask_stream(req: AskRequest):
                         "sources": evidence,
                         "abstained": True,
                         "rounds": 0,
-                        "hallucination_risk_score": 0,
+                        "hallucination_risk_score": bad_metrics["hallucination_risk_score"],
+                        "hallucination_percentage": bad_metrics["hallucination_percentage"],
+                        "metrics": bad_metrics,
                         "answer_override": ABSTENTION_FALLBACK_MESSAGE,
                     })
                 else:
+                    metrics = compute_hallucination_metrics(verdicts, False)
                     yield event({
                         "type": "verify",
                         "claims": verdicts,
                         "sources": evidence,
                         "abstained": False,
                         "rounds": 0,
-                        "hallucination_risk_score": compute_hallucination_risk_score(verdicts, False),
+                        "hallucination_risk_score": metrics["hallucination_risk_score"],
+                        "hallucination_percentage": metrics["hallucination_percentage"],
+                        "metrics": metrics,
                     })
 
             yield event({"type": "done"})
