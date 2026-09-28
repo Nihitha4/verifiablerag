@@ -6,11 +6,15 @@ Pipeline:
              -> (if needed) Re-retrieval -> Regeneration / Abstention
 """
 
-from modules.llm_client import chat, safe_json_parse
-from modules.vectorstore import retrieve
 import os
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 import re
 import unicodedata
+
+from modules.llm_client import chat, safe_json_parse
+from modules.vectorstore import retrieve
 
 ABSTENTION_MESSAGE = (
     "I don't have enough evidence in the provided document(s) to answer "
@@ -650,7 +654,7 @@ def extract_and_verify_claims(
         messages,
         temperature=0.0,
         json_mode=True,
-        max_tokens=int(os.getenv("LLM_VERIFY_MAX_TOKENS", "600")),
+        max_tokens=int(os.getenv("LLM_VERIFY_MAX_TOKENS", "2500")),
     )
     parsed = safe_json_parse(raw, fallback={"verdicts": []})
     verdicts = parsed.get("verdicts", [])

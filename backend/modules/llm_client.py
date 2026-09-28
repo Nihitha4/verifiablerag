@@ -19,7 +19,7 @@ from openai import (
     RateLimitError,
 )
 
-load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"), override=True)
 
 _client = None
 
@@ -71,7 +71,7 @@ def get_client() -> OpenAI:
 
 
 def _model_name() -> str:
-    return os.getenv("LLM_MODEL", "llama-3.1-8b-instant")
+    return os.getenv("LLM_MODEL", "qwen/qwen3.8-27b")
 
 
 _MAX_RATE_LIMIT_RETRIES = int(os.getenv("LLM_RATE_LIMIT_RETRIES", "4"))
